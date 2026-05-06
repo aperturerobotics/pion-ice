@@ -1398,7 +1398,7 @@ func (a *Agent) gatherCandidatesRelay(ctx context.Context, config *gatherConfig,
 							InsecureSkipVerify: a.insecureSkipVerify, //nolint:gosec
 						})
 
-						if hsErr := conn.HandshakeContext(ctx); hsErr != nil {
+						if hsErr := handshakeTLSConn(ctx, conn); hsErr != nil {
 							if closeErr := tcpConn.Close(); closeErr != nil {
 								a.log.Errorf("Failed to close relay connection: %v", closeErr)
 							}
