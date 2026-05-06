@@ -100,7 +100,7 @@ func turnNetworkTypesForURL(url stun.URI, networkTypes []NetworkType) []NetworkT
 
 // Close a net.Conn and log if we have a failure.
 func closeConnAndLog(c io.Closer, log logging.LeveledLogger, msg string, args ...any) {
-	if c == nil || (reflect.ValueOf(c).Kind() == reflect.Ptr && reflect.ValueOf(c).IsNil()) {
+	if c == nil || (reflect.ValueOf(c).Kind() == reflect.Pointer && reflect.ValueOf(c).IsNil()) {
 		log.Warnf("Connection is not allocated: "+msg, args...)
 
 		return
@@ -1121,7 +1121,7 @@ func (a *Agent) gatherCandidatesRelay(ctx context.Context, urls []*stun.URI) {
 							InsecureSkipVerify: a.insecureSkipVerify, //nolint:gosec
 						})
 
-						if hsErr := conn.HandshakeContext(ctx); hsErr != nil {
+						if hsErr := handshakeTLSConn(ctx, conn); hsErr != nil {
 							if closeErr := tcpConn.Close(); closeErr != nil {
 								a.log.Errorf("Failed to close relay connection: %v", closeErr)
 							}
