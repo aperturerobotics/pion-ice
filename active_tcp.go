@@ -189,23 +189,5 @@ func (a *activeTCPConn) SetWriteDeadline(t time.Time) error {
 }
 
 func getTCPAddrOnInterface(address string) (*net.TCPAddr, error) {
-	addr, err := net.ResolveTCPAddr("tcp", address)
-	if err != nil {
-		return nil, err
-	}
-
-	l, err := net.ListenTCP("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = l.Close()
-	}()
-
-	tcpAddr, ok := l.Addr().(*net.TCPAddr)
-	if !ok {
-		return nil, errInvalidAddress
-	}
-
-	return tcpAddr, nil
+	return listenTCPAddrOnInterface(address)
 }
