@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"reflect"
 	"slices"
 	"strconv"
 	"sync"
@@ -276,7 +275,7 @@ func turnNetworkTypesForURL(url stun.URI, networkTypes []NetworkType) []NetworkT
 
 // Close a net.Conn and log if we have a failure.
 func closeConnAndLog(c io.Closer, log logging.LeveledLogger, msg string, args ...any) {
-	if c == nil || (reflect.ValueOf(c).Kind() == reflect.Pointer && reflect.ValueOf(c).IsNil()) {
+	if isNilCloser(c) {
 		log.Warnf("Connection is not allocated: "+msg, args...)
 
 		return
@@ -285,6 +284,33 @@ func closeConnAndLog(c io.Closer, log logging.LeveledLogger, msg string, args ..
 	log.Warnf(msg, args...)
 	if err := c.Close(); err != nil {
 		log.Warnf("Failed to close connection: %v", err)
+	}
+}
+
+func isNilCloser(c io.Closer) bool {
+	if c == nil {
+		return true
+	}
+
+	switch conn := c.(type) {
+	case *net.UDPConn:
+		return conn == nil
+	case *net.TCPConn:
+		return conn == nil
+	case *tls.Conn:
+		return conn == nil
+	case *turn.STUNConn:
+		return conn == nil
+	case *fakenet.PacketConn:
+		return conn == nil
+	case *sharedPacketConn:
+		return conn == nil
+	case *tcpPacketConn:
+		return conn == nil
+	case *udpMuxedConn:
+		return conn == nil
+	default:
+		return false
 	}
 }
 
