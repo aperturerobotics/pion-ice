@@ -189,3 +189,79 @@ func TestHandlerNotifier_EnqueueSelectedCandidatePair_AfterClose(t *testing.T) {
 		}
 	}, 250*time.Millisecond, 10*time.Millisecond, "candidatePairFunc should not be called after close")
 }
+
+func TestCandidateNotifierCallbackSnapshot(t *testing.T) {
+	defer test.CheckRoutines(t)()
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	calls := make(chan string, 3)
+	agent, err := NewAgent(&AgentConfig{})
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, agent.Close())
+	}()
+
+	require.NoError(t, agent.OnCandidate(func(Candidate) {
+		calls <- "first"
+		select {
+		case <-firstStarted:
+		default:
+			close(firstStarted)
+			<-releaseFirst
+		}
+	}))
+	agent.candidateNotifier.EnqueueCandidate(nil)
+	<-firstStarted
+
+	agent.candidateNotifier.EnqueueCandidate(nil)
+	require.NoError(t, agent.Restart("ufrag", "0123456789abcdef"))
+	require.NoError(t, agent.OnCandidate(func(Candidate) {
+		calls <- "second"
+	}))
+	agent.candidateNotifier.EnqueueCandidate(nil)
+	close(releaseFirst)
+
+	require.Equal(t, "first", <-calls)
+	require.Equal(t, "first", <-calls)
+	require.Equal(t, "second", <-calls)
+}
+
+func TestCandidateNotifierNilHandler(t *testing.T) {
+	defer test.CheckRoutines(t)()
+
+	agent := &Agent{}
+	agent.candidateNotifier = &handlerNotifier{
+		done: make(chan struct{}),
+	}
+
+	require.NoError(t, agent.OnCandidate(nil))
+	require.True(t, agent.candidateNotifier.hasCandidateFunc())
+	agent.candidateNotifier.EnqueueCandidate(nil)
+	agent.candidateNotifier.Close(true)
+}
+
+func TestCandidateNotifierCallbackReentrancy(t *testing.T) {
+	defer test.CheckRoutines(t)()
+
+	calls := make(chan string, 2)
+	agent := &Agent{}
+	agent.candidateNotifier = &handlerNotifier{
+		done: make(chan struct{}),
+	}
+
+	require.NoError(t, agent.OnCandidate(func(Candidate) {
+		calls <- "first"
+		if err := agent.OnCandidate(func(Candidate) {
+			calls <- "second"
+		}); err != nil {
+			t.Errorf("replace candidate handler: %v", err)
+		}
+		agent.candidateNotifier.EnqueueCandidate(nil)
+	}))
+	agent.candidateNotifier.EnqueueCandidate(nil)
+
+	require.Equal(t, "first", <-calls)
+	require.Equal(t, "second", <-calls)
+	agent.candidateNotifier.Close(true)
+}
