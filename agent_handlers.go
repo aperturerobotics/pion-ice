@@ -23,7 +23,7 @@ func (a *Agent) OnSelectedCandidatePairChange(f func(Candidate, Candidate)) erro
 // OnCandidate sets a handler that is fired when new candidates gathered. When
 // the gathering process complete the last candidate is nil.
 func (a *Agent) OnCandidate(f func(Candidate)) error {
-	a.onCandidateHdlr.Store(f)
+	a.candidateNotifier.setCandidateFunc(f)
 
 	return nil
 }
@@ -34,16 +34,15 @@ func (a *Agent) onSelectedCandidatePairChange(p *CandidatePair) {
 	}
 }
 
-func (a *Agent) onCandidate(c Candidate) {
-	if onCandidateHdlr, ok := a.onCandidateHdlr.Load().(func(Candidate)); ok && onCandidateHdlr != nil {
-		onCandidateHdlr(c)
-	}
-}
-
 func (a *Agent) onConnectionStateChange(s ConnectionState) {
 	if hdlr, ok := a.onConnectionStateChangeHdlr.Load().(func(ConnectionState)); ok && hdlr != nil {
 		hdlr(s)
 	}
+}
+
+type candidateNotification struct {
+	candidate Candidate
+	handler   func(Candidate)
 }
 
 type handlerNotifier struct {
@@ -56,8 +55,9 @@ type handlerNotifier struct {
 	connectionStates    []ConnectionState
 	connectionStateFunc func(ConnectionState)
 
-	candidates    []Candidate
-	candidateFunc func(Candidate)
+	candidates       []candidateNotification
+	candidateFunc    func(Candidate)
+	candidateFuncSet bool
 
 	selectedCandidatePairs []*CandidatePair
 	candidatePairFunc      func(*CandidatePair)
@@ -121,6 +121,20 @@ func (h *handlerNotifier) EnqueueConnectionState(state ConnectionState) {
 	}
 }
 
+func (h *handlerNotifier) setCandidateFunc(f func(Candidate)) {
+	h.Lock()
+	h.candidateFunc = f
+	h.candidateFuncSet = true
+	h.Unlock()
+}
+
+func (h *handlerNotifier) hasCandidateFunc() bool {
+	h.Lock()
+	defer h.Unlock()
+
+	return h.candidateFuncSet
+}
+
 func (h *handlerNotifier) EnqueueCandidate(cand Candidate) {
 	h.Lock()
 	defer h.Unlock()
@@ -144,11 +158,16 @@ func (h *handlerNotifier) EnqueueCandidate(cand Candidate) {
 			notification := h.candidates[0]
 			h.candidates = h.candidates[1:]
 			h.Unlock()
-			h.candidateFunc(notification)
+			if notification.handler != nil {
+				notification.handler(notification.candidate)
+			}
 		}
 	}
 
-	h.candidates = append(h.candidates, cand)
+	h.candidates = append(h.candidates, candidateNotification{
+		candidate: cand,
+		handler:   h.candidateFunc,
+	})
 	if !h.runningCandidates {
 		h.runningCandidates = true
 		h.notifiers.Add(1)

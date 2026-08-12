@@ -48,7 +48,6 @@ type Agent struct {
 
 	onConnectionStateChangeHdlr       atomic.Value // func(ConnectionState)
 	onSelectedCandidatePairChangeHdlr atomic.Value // func(Candidate, Candidate)
-	onCandidateHdlr                   atomic.Value // func(Candidate)
 
 	onConnected     chan struct{}
 	onConnectedOnce sync.Once
@@ -473,7 +472,7 @@ func newAgentWithConfig(agent *Agent, opts ...AgentOption) (*Agent, error) {
 		connectionStateFunc: agent.onConnectionStateChange,
 		done:                make(chan struct{}),
 	}
-	agent.candidateNotifier = &handlerNotifier{candidateFunc: agent.onCandidate, done: make(chan struct{})}
+	agent.candidateNotifier = &handlerNotifier{done: make(chan struct{})}
 	agent.selectedCandidatePairNotifier = &handlerNotifier{
 		candidatePairFunc: agent.onSelectedCandidatePairChange,
 		done:              make(chan struct{}),

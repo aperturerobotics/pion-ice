@@ -147,7 +147,7 @@ func (a *Agent) GatherCandidates() error {
 			gatherErr = ErrMultipleGatherAttempted
 
 			return
-		} else if a.onCandidateHdlr.Load() == nil {
+		} else if !a.candidateNotifier.hasCandidateFunc() {
 			gatherErr = ErrNoOnCandidateHandler
 
 			return
