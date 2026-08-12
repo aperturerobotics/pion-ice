@@ -332,7 +332,7 @@ func (a *Agent) Gather(opts ...GatherOption) error {
 		if gatherErr = a.validateGatherConfig(config); gatherErr != nil {
 			return
 		}
-		if a.onCandidateHdlr.Load() == nil {
+		if !a.candidateNotifier.hasHandler() {
 			gatherErr = ErrNoOnCandidateHandler
 
 			return
