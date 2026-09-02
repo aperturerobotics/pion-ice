@@ -61,8 +61,13 @@ func NewCandidateHost(config *CandidateHostConfig) (*CandidateHost, error) {
 			return nil, err
 		}
 	} else {
-		// Until mDNS candidate is resolved assume it is UDPv4
-		candidateHost.candidateBase.networkType = NetworkTypeUDP4
+		// Preserve the signaled transport while assuming IPv4 until the mDNS
+		// candidate resolves.
+		networkType, err := determineNetworkType(config.Network, netip.IPv4Unspecified())
+		if err != nil {
+			return nil, err
+		}
+		candidateHost.candidateBase.networkType = networkType
 	}
 
 	return candidateHost, nil

@@ -363,6 +363,15 @@ func mustCandidatePeerReflexiveWithExtensions(
 	return cand
 }
 
+func TestUnmarshalCandidatePreservesTCPMDNSNetwork(t *testing.T) {
+	const raw = "candidate:2 1 tcp 2105524479 1857884f-144b-45e4-9679-2840dba2fa1b.local 9 typ host tcptype active"
+
+	candidate, err := UnmarshalCandidate(raw)
+	require.NoError(t, err)
+	require.Equal(t, NetworkTypeTCP4, candidate.NetworkType())
+	require.Equal(t, strings.TrimPrefix(raw, "candidate:"), candidate.Marshal())
+}
+
 func TestCandidateMarshal(t *testing.T) {
 	for idx, test := range []struct {
 		candidate   Candidate
