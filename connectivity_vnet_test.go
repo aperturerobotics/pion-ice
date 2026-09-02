@@ -7,6 +7,7 @@ package ice
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"sync/atomic"
@@ -318,11 +319,11 @@ func pipeWithVNetUsingOptions(t *testing.T, opts0, opts1 []AgentOption) (*Conn, 
 	return aConn, bConn
 }
 
-func closePipe(t *testing.T, ca *Conn, cb *Conn) {
-	t.Helper()
+func closePipe(tb testing.TB, ca *Conn, cb *Conn) {
+	tb.Helper()
 
-	require.NoError(t, ca.Close())
-	require.NoError(t, cb.Close())
+	require.NoError(tb, ca.Close())
+	require.NoError(tb, cb.Close())
 }
 
 func TestConnectivityVNet(t *testing.T) {
@@ -790,7 +791,9 @@ func TestWriteUseValidPair(t *testing.T) {
 	go func() {
 		for {
 			if _, writeErr := (&Conn{agent: controllingAgent}).Write(testMessage); writeErr != nil {
-				return
+				if !errors.Is(writeErr, ErrNoCandidatePairs) {
+					return
+				}
 			}
 
 			time.Sleep(20 * time.Millisecond)

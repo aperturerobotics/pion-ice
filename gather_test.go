@@ -214,6 +214,28 @@ func TestGatherConcurrency(t *testing.T) {
 	<-candidateGathered.Done()
 }
 
+// TestAgentRestartThenGatherRepeatedly guards a gathering-state race where
+// restarting mid-gather leaves gatheringState wedged, so subsequent
+// GatherCandidates calls fail with ErrMultipleGatherAttempted.
+func TestAgentRestartThenGatherRepeatedly(t *testing.T) {
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(time.Second * 30).Stop()
+
+	agent, err := NewAgent(&AgentConfig{})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, agent.Close()) }()
+
+	require.NoError(t, agent.OnCandidate(func(Candidate) {}))
+	require.NoError(t, agent.GatherCandidates())
+
+	// Restart immediately, before the previous cycle has settled, many times.
+	const restarts = 300
+	for range restarts {
+		require.NoError(t, agent.Restart("", ""))
+		require.NoError(t, agent.GatherCandidates())
+	}
+}
+
 func TestLoopbackCandidate(t *testing.T) {
 	defer test.CheckRoutines(t)()
 
@@ -331,9 +353,9 @@ func TestSTUNConcurrency(t *testing.T) {
 
 	defer test.TimeOut(time.Second * 30).Stop()
 
-	serverPort := randomPort(t)
-	serverListener, err := net.ListenPacket("udp4", localhostIPStr+":"+strconv.Itoa(serverPort)) // nolint: noctx
+	serverListener, err := net.ListenPacket("udp4", localhostIPStr+":0") // nolint: noctx
 	require.NoError(t, err)
+	serverPort := portFromAddr(t, serverListener.LocalAddr())
 
 	server, err := turn.NewServer(turn.ServerConfig{
 		Realm:       "pion.ly",
@@ -494,17 +516,17 @@ func TestTURNConcurrency(t *testing.T) {
 	}
 
 	t.Run("UDP Relay", func(t *testing.T) {
-		serverPort := randomPort(t)
-		serverListener, err := net.ListenPacket("udp", localhostIPStr+":"+strconv.Itoa(serverPort)) // nolint: noctx
+		serverListener, err := net.ListenPacket("udp", localhostIPStr+":0") // nolint: noctx
 		require.NoError(t, err)
+		serverPort := portFromAddr(t, serverListener.LocalAddr())
 
 		runTest(stun.ProtoTypeUDP, stun.SchemeTypeTURN, serverListener, nil, serverPort)
 	})
 
 	t.Run("TCP Relay", func(t *testing.T) {
-		serverPort := randomPort(t)
-		serverListener, err := net.Listen("tcp", localhostIPStr+":"+strconv.Itoa(serverPort)) // nolint: noctx
+		serverListener, err := net.Listen("tcp", localhostIPStr+":0") // nolint: noctx
 		require.NoError(t, err)
+		serverPort := portFromAddr(t, serverListener.Addr())
 
 		runTest(stun.ProtoTypeTCP, stun.SchemeTypeTURN, nil, serverListener, serverPort)
 	})
@@ -513,11 +535,11 @@ func TestTURNConcurrency(t *testing.T) {
 		certificate, genErr := selfsign.GenerateSelfSigned()
 		require.NoError(t, genErr)
 
-		serverPort := randomPort(t)
-		serverListener, err := tls.Listen("tcp", localhostIPStr+":"+strconv.Itoa(serverPort), &tls.Config{ //nolint:gosec
+		serverListener, err := tls.Listen("tcp", localhostIPStr+":0", &tls.Config{ //nolint:gosec
 			Certificates: []tls.Certificate{certificate},
 		})
 		require.NoError(t, err)
+		serverPort := portFromAddr(t, serverListener.Addr())
 
 		runTest(stun.ProtoTypeTCP, stun.SchemeTypeTURNS, nil, serverListener, serverPort)
 	})
@@ -526,13 +548,13 @@ func TestTURNConcurrency(t *testing.T) {
 		certificate, genErr := selfsign.GenerateSelfSigned()
 		require.NoError(t, genErr)
 
-		serverPort := randomPort(t)
 		serverListener, err := dtls.ListenWithOptions(
 			"udp",
-			&net.UDPAddr{IP: net.ParseIP(localhostIPStr), Port: serverPort},
+			&net.UDPAddr{IP: net.ParseIP(localhostIPStr), Port: 0},
 			dtls.WithCertificates(certificate),
 		)
 		require.NoError(t, err)
+		serverPort := portFromAddr(t, serverListener.Addr())
 
 		runTest(stun.ProtoTypeUDP, stun.SchemeTypeTURNS, nil, serverListener, serverPort)
 	})
@@ -544,9 +566,9 @@ func TestSTUNTURNConcurrency(t *testing.T) {
 
 	defer test.TimeOut(time.Second * 8).Stop()
 
-	serverPort := randomPort(t)
-	serverListener, err := net.ListenPacket("udp4", localhostIPStr+":"+strconv.Itoa(serverPort)) // nolint: noctx
+	serverListener, err := net.ListenPacket("udp4", localhostIPStr+":0") // nolint: noctx
 	require.NoError(t, err)
+	serverPort := portFromAddr(t, serverListener.LocalAddr())
 
 	server, err := turn.NewServer(turn.ServerConfig{
 		Realm:       "pion.ly",
@@ -617,9 +639,9 @@ func TestTURNSrflx(t *testing.T) {
 
 	defer test.TimeOut(time.Second * 30).Stop()
 
-	serverPort := randomPort(t)
-	serverListener, err := net.ListenPacket("udp4", localhostIPStr+":"+strconv.Itoa(serverPort)) // nolint: noctx
+	serverListener, err := net.ListenPacket("udp4", localhostIPStr+":0") // nolint: noctx
 	require.NoError(t, err)
+	serverPort := portFromAddr(t, serverListener.LocalAddr())
 
 	server, err := turn.NewServer(turn.ServerConfig{
 		Realm:       "pion.ly",
@@ -692,7 +714,7 @@ func TestGatherCandidatesRelayProducesRelay(t *testing.T) {
 		require.NoError(t, server.Close())
 	}()
 
-	serverPort := listener.LocalAddr().(*net.UDPAddr).Port //nolint:forcetypeassert
+	serverPort := portFromAddr(t, listener.LocalAddr())
 	turnURL := &stun.URI{
 		Scheme:   stun.SchemeTypeTURN,
 		Host:     "127.0.0.1",
@@ -1522,7 +1544,7 @@ func TestGatherCandidatesRelayRespectsInterfaceFilter(t *testing.T) {
 			},
 		}),
 		WithInterfaceFilter(func(iface string) bool {
-			return iface == "eth0"
+			return iface == "eth0" //nolint:goconst
 		}),
 		WithIncludeLoopback(),
 	)
@@ -2130,14 +2152,13 @@ func TestMultiUDPMuxUsage(t *testing.T) {
 	var expectedPorts []int
 	var udpMuxInstances []UDPMux
 	for i := range 3 {
-		port := randomPort(t)
-		conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IP{127, 0, 0, 1}, Port: port})
+		conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IP{127, 0, 0, 1}, Port: 0})
 		require.NoError(t, err)
 		defer func() {
 			_ = conn.Close()
 		}()
 
-		expectedPorts = append(expectedPorts, port)
+		expectedPorts = append(expectedPorts, portFromAddr(t, conn.LocalAddr()))
 		muxDefault := NewUDPMuxDefault(UDPMuxParams{UDPConn: conn})
 		udpMuxInstances = append(udpMuxInstances, muxDefault)
 		idx := i
@@ -3225,17 +3246,16 @@ func TestMultiTCPMuxUsage(t *testing.T) {
 	var expectedPorts []int
 	var tcpMuxInstances []TCPMux
 	for range 3 {
-		port := randomPort(t)
 		listener, err := net.ListenTCP("tcp", &net.TCPAddr{
 			IP:   net.IP{127, 0, 0, 1},
-			Port: port,
+			Port: 0,
 		})
 		require.NoError(t, err)
 		defer func() {
 			_ = listener.Close()
 		}()
 
-		expectedPorts = append(expectedPorts, port)
+		expectedPorts = append(expectedPorts, portFromAddr(t, listener.Addr()))
 		tcpMux := NewTCPMuxDefault(TCPMuxParams{
 			Listener:       listener,
 			ReadBufferSize: 8,
@@ -3741,9 +3761,9 @@ func TestGatherAddressRewriteAppendHostMultiUDPMux(t *testing.T) { //nolint:cycl
 	for _, port := range expectedPorts {
 		group := byPort[port]
 		require.Len(t, group, 2, "expected 2 alias candidates for port %d", port)
-		wrapA, ok := group[0].conn.(*sharedPacketConn)
+		wrapA, ok := group[0].conn.(*sharedAddrPortConn)
 		require.True(t, ok)
-		wrapB, ok := group[1].conn.(*sharedPacketConn)
+		wrapB, ok := group[1].conn.(*sharedAddrPortConn)
 		require.True(t, ok)
 		require.Same(t, wrapA.underlying, wrapB.underlying,
 			"aliases on the same mux port must share one udpMuxedConn")
@@ -3956,7 +3976,7 @@ func TestUniversalUDPMuxUsage(t *testing.T) {
 
 	defer test.TimeOut(time.Second * 30).Stop()
 
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IP{127, 0, 0, 1}, Port: randomPort(t)})
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IP{127, 0, 0, 1}, Port: 0})
 	require.NoError(t, err)
 	defer func() {
 		_ = conn.Close()

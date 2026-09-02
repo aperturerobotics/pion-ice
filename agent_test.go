@@ -7,10 +7,13 @@ package ice
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,16 +24,6 @@ import (
 	"github.com/pion/transport/v4/vnet"
 	"github.com/stretchr/testify/require"
 )
-
-type BadAddr struct{}
-
-func (ba *BadAddr) Network() string {
-	return "xxx"
-}
-
-func (ba *BadAddr) String() string {
-	return "yyy"
-}
 
 type recordingSelector struct {
 	handledBindingRequest bool
@@ -43,12 +36,606 @@ func (r *recordingSelector) ContactCandidates() {}
 
 func (r *recordingSelector) PingCandidate(Candidate, Candidate) {}
 
-func (r *recordingSelector) HandleSuccessResponse(*stun.Message, Candidate, Candidate, net.Addr) {
+func (r *recordingSelector) HandleSuccessResponse(*stun.Message, Candidate, Candidate, netip.AddrPort) {
 	r.handledSuccess = true
 }
 
 func (r *recordingSelector) HandleBindingRequest(*stun.Message, Candidate, Candidate) {
 	r.handledBindingRequest = true
+}
+
+type blockingWritePacketConn struct {
+	writeStarted     chan struct{}
+	writeStartedOnce sync.Once
+	closed           chan struct{}
+	closeOnce        sync.Once
+}
+
+func newBlockingWritePacketConn() *blockingWritePacketConn {
+	return &blockingWritePacketConn{
+		writeStarted: make(chan struct{}),
+		closed:       make(chan struct{}),
+	}
+}
+
+func (b *blockingWritePacketConn) ReadFrom([]byte) (int, net.Addr, error) {
+	<-b.closed
+
+	return 0, nil, io.EOF
+}
+
+func (b *blockingWritePacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	b.writeStartedOnce.Do(func() {
+		close(b.writeStarted)
+	})
+
+	<-b.closed
+
+	return 0, io.ErrClosedPipe
+}
+
+func (b *blockingWritePacketConn) Close() error {
+	b.closeOnce.Do(func() {
+		close(b.closed)
+	})
+
+	return nil
+}
+
+func (b *blockingWritePacketConn) LocalAddr() net.Addr {
+	return &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1}
+}
+
+func (b *blockingWritePacketConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (b *blockingWritePacketConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (b *blockingWritePacketConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
+type deadlineBlockingPacketConn struct {
+	*blockingWritePacketConn
+	writeDeadlineSet  chan struct{}
+	writeDeadlineOnce sync.Once
+}
+
+func newDeadlineBlockingPacketConn() *deadlineBlockingPacketConn {
+	return &deadlineBlockingPacketConn{
+		blockingWritePacketConn: newBlockingWritePacketConn(),
+		writeDeadlineSet:        make(chan struct{}),
+	}
+}
+
+func (b *deadlineBlockingPacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	b.writeStartedOnce.Do(func() {
+		close(b.writeStarted)
+	})
+
+	select {
+	case <-b.closed:
+		return 0, io.ErrClosedPipe
+	case <-b.writeDeadlineSet:
+		return 0, os.ErrDeadlineExceeded
+	}
+}
+
+func (b *deadlineBlockingPacketConn) SetDeadline(t time.Time) error {
+	return b.SetWriteDeadline(t)
+}
+
+func (b *deadlineBlockingPacketConn) SetWriteDeadline(t time.Time) error {
+	if !t.IsZero() {
+		b.writeDeadlineOnce.Do(func() {
+			close(b.writeDeadlineSet)
+		})
+	}
+
+	return nil
+}
+
+type blockingMuxedPacketConn struct {
+	*blockingWritePacketConn
+	refs       atomic.Int32
+	closeCount atomic.Int32
+}
+
+func newBlockingMuxedPacketConn() *blockingMuxedPacketConn {
+	return &blockingMuxedPacketConn{
+		blockingWritePacketConn: newBlockingWritePacketConn(),
+	}
+}
+
+func (b *blockingMuxedPacketConn) readFromContext(ctx context.Context, _ []byte) (int, net.Addr, error) {
+	select {
+	case <-ctx.Done():
+		return 0, nil, ctx.Err()
+	case <-b.closed:
+		return 0, nil, io.EOF
+	}
+}
+
+func (b *blockingMuxedPacketConn) Close() error {
+	b.closeCount.Add(1)
+
+	return b.blockingWritePacketConn.Close()
+}
+
+func TestAgentCloseAbortsBlockedCandidateWrite(t *testing.T) {
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(2 * time.Second).Stop()
+
+	agent, err := NewAgent(&AgentConfig{})
+	require.NoError(t, err)
+
+	conn := newBlockingWritePacketConn()
+	local, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   NetworkTypeUDP4.String(),
+		Address:   "192.0.2.1",
+		Port:      1,
+		Component: ComponentRTP,
+	})
+	require.NoError(t, err)
+	local.start(agent, conn, agent.startedCh)
+
+	remote, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   NetworkTypeUDP4.String(),
+		Address:   "192.0.2.2",
+		Port:      2,
+		Component: ComponentRTP,
+	})
+	require.NoError(t, err)
+
+	msg, err := stun.Build(stun.BindingRequest, stun.TransactionID)
+	require.NoError(t, err)
+
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- agent.loop.Run(agent.loop, func(context.Context) {
+			agent.sendSTUN(msg, local, remote)
+		})
+	}()
+
+	select {
+	case <-conn.writeStarted:
+	case <-time.After(time.Second):
+		require.Fail(t, "timed out waiting for candidate write to block")
+	}
+
+	closeErr := make(chan error, 1)
+	go func() {
+		closeErr <- agent.Close()
+	}()
+
+	select {
+	case <-conn.closed:
+	case <-time.After(time.Second):
+		require.Fail(t, "timed out waiting for close to abort candidate I/O")
+	}
+
+	select {
+	case err := <-closeErr:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.Fail(t, "timed out waiting for agent close")
+	}
+
+	require.NoError(t, <-runErr)
+}
+
+func TestAgentCloseAbortsBlockedSharedCandidateWrite(t *testing.T) {
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(2 * time.Second).Stop()
+
+	agent, err := NewAgent(&AgentConfig{})
+	require.NoError(t, err)
+
+	muxedConn := newBlockingMuxedPacketConn()
+	localA, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   NetworkTypeUDP4.String(),
+		Address:   "192.0.2.1",
+		Port:      1,
+		Component: ComponentRTP,
+	})
+	require.NoError(t, err)
+	localA.start(agent, newSharedPacketConn(muxedConn, &muxedConn.refs), agent.startedCh)
+
+	localB, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   NetworkTypeUDP4.String(),
+		Address:   "192.0.2.1",
+		Port:      2,
+		Component: ComponentRTP,
+	})
+	require.NoError(t, err)
+	localB.start(agent, newSharedPacketConn(muxedConn, &muxedConn.refs), agent.startedCh)
+
+	remote, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   NetworkTypeUDP4.String(),
+		Address:   "192.0.2.2",
+		Port:      3,
+		Component: ComponentRTP,
+	})
+	require.NoError(t, err)
+
+	msg, err := stun.Build(stun.BindingRequest, stun.TransactionID)
+	require.NoError(t, err)
+
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- agent.loop.Run(agent.loop, func(context.Context) {
+			agent.sendSTUN(msg, localA, remote)
+		})
+	}()
+
+	select {
+	case <-muxedConn.writeStarted:
+	case <-time.After(time.Second):
+		require.Fail(t, "timed out waiting for shared candidate write to block")
+	}
+
+	closeErr := make(chan error, 1)
+	go func() {
+		closeErr <- agent.Close()
+	}()
+
+	select {
+	case <-muxedConn.closed:
+	case <-time.After(time.Second):
+		require.Fail(t, "timed out waiting for close to abort shared candidate I/O")
+	}
+
+	select {
+	case err := <-closeErr:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.Fail(t, "timed out waiting for agent close")
+	}
+
+	require.NoError(t, <-runErr)
+	require.Equal(t, int32(0), muxedConn.refs.Load())
+	require.Equal(t, int32(1), muxedConn.closeCount.Load())
+}
+
+func TestAgentCloseAbortsBlockedUDPMuxWrite(t *testing.T) {
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(2 * time.Second).Stop()
+
+	agent, err := NewAgent(&AgentConfig{})
+	require.NoError(t, err)
+
+	udpConn := newDeadlineBlockingPacketConn()
+	udpMux := NewUDPMuxDefault(UDPMuxParams{UDPConn: udpConn})
+	defer func() {
+		_ = udpMux.Close()
+	}()
+
+	muxedConn, err := udpMux.GetConn(agent.localUfrag, udpConn.LocalAddr())
+	require.NoError(t, err)
+
+	local, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   NetworkTypeUDP4.String(),
+		Address:   "192.0.2.1",
+		Port:      1,
+		Component: ComponentRTP,
+	})
+	require.NoError(t, err)
+	local.start(agent, muxedConn, agent.startedCh)
+
+	remote, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   NetworkTypeUDP4.String(),
+		Address:   "192.0.2.2",
+		Port:      2,
+		Component: ComponentRTP,
+	})
+	require.NoError(t, err)
+
+	msg, err := stun.Build(stun.BindingRequest, stun.TransactionID)
+	require.NoError(t, err)
+
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- agent.loop.Run(agent.loop, func(context.Context) {
+			agent.sendSTUN(msg, local, remote)
+		})
+	}()
+
+	select {
+	case <-udpConn.writeStarted:
+	case <-time.After(time.Second):
+		require.Fail(t, "timed out waiting for UDP mux write to block")
+	}
+
+	closeErr := make(chan error, 1)
+	go func() {
+		closeErr <- agent.Close()
+	}()
+
+	select {
+	case err := <-closeErr:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		_ = udpConn.Close()
+		<-closeErr
+		require.Fail(t, "agent close did not abort blocked UDP mux write")
+	}
+
+	require.NoError(t, <-runErr)
+}
+
+func TestAgentCloseAbortsBlockedUDPMuxSrflxGatherWrite(t *testing.T) {
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(2 * time.Second).Stop()
+
+	udpConn := newDeadlineBlockingPacketConn()
+	udpMux := NewUniversalUDPMuxDefault(UniversalUDPMuxParams{UDPConn: udpConn})
+	defer func() {
+		_ = udpMux.Close()
+	}()
+
+	agent, err := NewAgent(&AgentConfig{
+		NetworkTypes:   []NetworkType{NetworkTypeUDP4},
+		CandidateTypes: []CandidateType{CandidateTypeServerReflexive},
+		Urls: []*stun.URI{{
+			Scheme: stun.SchemeTypeSTUN,
+			Host:   "192.0.2.2",
+			Port:   3478,
+		}},
+		UDPMuxSrflx: udpMux,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, agent.OnCandidate(func(Candidate) {}))
+	require.NoError(t, agent.GatherCandidates())
+
+	select {
+	case <-udpConn.writeStarted:
+	case <-time.After(time.Second):
+		require.FailNow(t, "timed out waiting for UDP mux srflx gather write to block")
+	}
+
+	closeErr := make(chan error, 1)
+	go func() {
+		closeErr <- agent.Close()
+	}()
+
+	select {
+	case err := <-closeErr:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "agent close did not abort blocked UDP mux srflx gather write")
+	}
+}
+
+func TestAgentCloseDoesNotAbortOtherAgentUDPMuxSrflxGatherWrite(t *testing.T) { //nolint:cyclop
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(2 * time.Second).Stop()
+
+	udpConn := newDeadlineBlockingPacketConn()
+	udpMux := NewUniversalUDPMuxDefault(UniversalUDPMuxParams{UDPConn: udpConn})
+	defer func() {
+		_ = udpMux.Close()
+	}()
+
+	newSrflxAgent := func(t *testing.T) *Agent {
+		t.Helper()
+
+		agent, err := NewAgent(&AgentConfig{
+			NetworkTypes:   []NetworkType{NetworkTypeUDP4},
+			CandidateTypes: []CandidateType{CandidateTypeServerReflexive},
+			Urls: []*stun.URI{{
+				Scheme: stun.SchemeTypeSTUN,
+				Host:   "192.0.2.2",
+				Port:   3478,
+			}},
+			UDPMuxSrflx: udpMux,
+		})
+		require.NoError(t, err)
+
+		return agent
+	}
+
+	agent1 := newSrflxAgent(t)
+	defer func() {
+		_ = agent1.Close()
+	}()
+
+	agent2 := newSrflxAgent(t)
+	defer func() {
+		_ = agent2.Close()
+	}()
+
+	require.NoError(t, agent2.OnCandidate(func(Candidate) {}))
+	require.NoError(t, agent2.GatherCandidates())
+
+	select {
+	case <-udpConn.writeStarted:
+	case <-time.After(time.Second):
+		require.FailNow(t, "timed out waiting for second agent UDP mux srflx gather write to block")
+	}
+
+	closeErr := make(chan error, 1)
+	go func() {
+		closeErr <- agent1.Close()
+	}()
+
+	select {
+	case err := <-closeErr:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "first agent close blocked")
+	}
+
+	select {
+	case <-udpConn.writeDeadlineSet:
+		require.FailNow(t, "first agent close aborted another agent's UDP mux srflx gather write")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	secondCloseErr := make(chan error, 1)
+	go func() {
+		secondCloseErr <- agent2.Close()
+	}()
+
+	select {
+	case <-udpConn.writeDeadlineSet:
+	case <-time.After(time.Second):
+		require.FailNow(t, "second agent close did not abort its own UDP mux srflx gather write")
+	}
+
+	select {
+	case err := <-secondCloseErr:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "second agent close blocked")
+	}
+}
+
+func TestAgentCloseClearsSharedUDPMuxAbortDeadlineForOtherAgent(t *testing.T) { //nolint:cyclop
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(2 * time.Second).Stop()
+
+	udpConn := newBlockingDeadlinePacketConn()
+	udpMux := NewUDPMuxDefault(UDPMuxParams{UDPConn: udpConn})
+	defer func() {
+		_ = udpMux.Close()
+	}()
+
+	newMuxAgent := func(t *testing.T) *Agent {
+		t.Helper()
+
+		agent, err := NewAgent(&AgentConfig{
+			NetworkTypes:    []NetworkType{NetworkTypeUDP4},
+			CandidateTypes:  []CandidateType{CandidateTypeHost},
+			UDPMux:          udpMux,
+			IncludeLoopback: true,
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, agent.gatherCandidatesLocalUDPMux(context.Background()))
+
+		return agent
+	}
+
+	agent1 := newMuxAgent(t)
+	defer func() {
+		_ = agent1.Close()
+	}()
+
+	agent2 := newMuxAgent(t)
+	defer func() {
+		_ = agent2.Close()
+	}()
+
+	onlyLocalCandidate := func(t *testing.T, agent *Agent) Candidate {
+		t.Helper()
+
+		candidates, err := agent.GetLocalCandidates()
+		require.NoError(t, err)
+		require.Len(t, candidates, 1)
+
+		return candidates[0]
+	}
+
+	local1 := onlyLocalCandidate(t, agent1)
+	local2 := onlyLocalCandidate(t, agent2)
+
+	remote1, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   NetworkTypeUDP4.String(),
+		Address:   "192.0.2.2",
+		Port:      2,
+		Component: ComponentRTP,
+	})
+	require.NoError(t, err)
+
+	remote2, err := NewCandidateHost(&CandidateHostConfig{
+		Network:   NetworkTypeUDP4.String(),
+		Address:   "192.0.2.3",
+		Port:      3,
+		Component: ComponentRTP,
+	})
+	require.NoError(t, err)
+
+	msg, err := stun.Build(stun.BindingRequest, stun.TransactionID)
+	require.NoError(t, err)
+
+	firstRunErr := make(chan error, 1)
+	go func() {
+		firstRunErr <- agent1.loop.Run(agent1.loop, func(context.Context) {
+			agent1.sendSTUN(msg, local1, remote1)
+		})
+	}()
+
+	select {
+	case <-udpConn.firstWriteStarted:
+	case <-time.After(time.Second):
+		require.FailNow(t, "timed out waiting for first agent write to block")
+	}
+
+	closeErr := make(chan error, 1)
+	go func() {
+		closeErr <- agent1.Close()
+	}()
+
+	select {
+	case <-udpConn.deadlineSet:
+	case <-time.After(time.Second):
+		require.FailNow(t, "timed out waiting for UDP mux abort deadline")
+	}
+
+	close(udpConn.allowFirstReturn)
+
+	select {
+	case <-udpConn.deadlineCleared:
+	case <-time.After(time.Second):
+		require.FailNow(t, "timed out waiting for UDP mux abort deadline to clear")
+	}
+
+	select {
+	case err := <-closeErr:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		require.FailNow(t, "timed out waiting for first agent close")
+	}
+
+	require.NoError(t, <-firstRunErr)
+
+	select {
+	case <-udpConn.closed:
+		require.FailNow(t, "shared UDP socket was closed by first agent")
+	default:
+	}
+
+	const payload = "second"
+	secondResult := make(chan struct {
+		n   int
+		err error
+	}, 1)
+	go func() {
+		var n int
+		var writeErr error
+		runErr := agent2.loop.Run(agent2.loop, func(context.Context) {
+			n, writeErr = local2.writeTo([]byte(payload), remote2)
+		})
+		if writeErr == nil {
+			writeErr = runErr
+		}
+		secondResult <- struct {
+			n   int
+			err error
+		}{n: n, err: writeErr}
+	}()
+
+	select {
+	case result := <-secondResult:
+		require.NoError(t, result.err)
+		require.Equal(t, len(payload), result.n)
+	case <-time.After(time.Second):
+		require.FailNow(t, "timed out waiting for second agent write")
+	}
 }
 
 func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
@@ -78,7 +665,7 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 			local.conn = &fakenet.MockPacketConn{}
 			require.NoError(t, err)
 
-			remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+			remote := netip.MustParseAddrPort("172.17.0.3:999")
 
 			msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
 				stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
@@ -108,6 +695,67 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 		}))
 	})
 
+	t.Run("Resolved mDNS candidate is matched instead of creating prflx", func(t *testing.T) {
+		agent, err := NewAgent(&AgentConfig{})
+		require.NoError(t, err)
+		defer func() {
+			require.NoError(t, agent.Close())
+		}()
+
+		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
+			sel := &controllingSelector{agent: agent, log: agent.log}
+			agent.selector = sel
+
+			local, err := NewCandidateHost(&CandidateHostConfig{
+				Network:   "udp",
+				Address:   "192.168.0.2",
+				Port:      777,
+				Component: 1,
+			})
+			require.NoError(t, err)
+			local.conn = &fakenet.MockPacketConn{}
+
+			remoteMDNS, err := NewCandidateHost(&CandidateHostConfig{
+				Network:   "udp",
+				Address:   "1f4712db-ea17-4bcf-a596-105139dfd8bf.local",
+				Port:      999,
+				Component: 1,
+			})
+			require.NoError(t, err)
+			// Resolve and register the candidate with the same calls
+			// resolveAndAddMulticastCandidate makes after its mDNS query
+			// returns; only the query itself is skipped here.
+			require.NoError(t, remoteMDNS.setIPAddr(netip.MustParseAddr("172.17.0.3")))
+			// nolint: contextcheck
+			require.True(t, agent.addRemoteCandidate(remoteMDNS))
+
+			msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
+				stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
+				UseCandidate(),
+				AttrControlling(agent.tieBreaker),
+				PriorityAttr(local.Priority()),
+				stun.NewShortTermIntegrity(agent.localPwd),
+				stun.Fingerprint,
+			)
+			require.NoError(t, err)
+
+			// nolint: contextcheck
+			agent.handleInbound(msg, local, netip.MustParseAddrPort("172.17.0.3:999"))
+
+			// The inbound traffic must match the resolved mDNS candidate by
+			// transport address rather than surfacing a duplicate prflx
+			// candidate for the same remote.
+			// See:
+			//  - https://datatracker.ietf.org/doc/html/rfc8445#section-7.3.1.3
+			//  - https://datatracker.ietf.org/doc/html/rfc8445#section-4
+			//  - (expired draft) https://datatracker.ietf.org/doc/html/draft-ietf-mmusic-mdns-ice-candidates-03#section-3.2.1
+			set := agent.remoteCandidates[local.NetworkType()]
+			require.Len(t, set, 1)
+			require.Same(t, Candidate(remoteMDNS), set[0])
+			require.Equal(t, "1f4712db-ea17-4bcf-a596-105139dfd8bf.local", set[0].Address())
+		}))
+	})
+
 	t.Run("prflx candidate priority comes from inbound PRIORITY", func(t *testing.T) {
 		agent, err := NewAgent(&AgentConfig{})
 		require.NoError(t, err)
@@ -128,7 +776,7 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 			require.NoError(t, err)
 			local.conn = &fakenet.MockPacketConn{}
 
-			remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+			remote := netip.MustParseAddrPort("172.17.0.3:999")
 			remotePriority := uint32(123456)
 
 			msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
@@ -174,7 +822,7 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 			local.conn = &fakenet.MockPacketConn{}
 			agent.localCandidates[local.NetworkType()] = []Candidate{local}
 
-			remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+			remote := netip.MustParseAddrPort("172.17.0.3:999")
 			msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
 				stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
 				UseCandidate(),
@@ -231,7 +879,7 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 			require.Equal(t, prflx, pair.Remote)
 			require.Same(t, updatedPair, agent.getSelectedPair())
 			require.Same(t, updatedPair, sel.nominatedPair)
-			cached, ok := local.remoteCandidateCaches.Load(toAddrPort(remote))
+			cached, ok := local.remoteCandidateCaches.Load(toAddrPortKey(remote))
 			require.True(t, ok)
 			require.Equal(t, host, cached)
 		}))
@@ -257,7 +905,7 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 			local.conn = &fakenet.MockPacketConn{}
 			agent.localCandidates[local.NetworkType()] = []Candidate{local}
 
-			remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+			remote := netip.MustParseAddrPort("172.17.0.3:999")
 			msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
 				stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
 				UseCandidate(),
@@ -304,7 +952,7 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 			require.Equal(t, srflx, updatedPair.Remote)
 			require.Equal(t, oldPriority, updatedPair.priority())
 			require.Equal(t, prflx, pair.Remote)
-			cached, ok := local.remoteCandidateCaches.Load(toAddrPort(remote))
+			cached, ok := local.remoteCandidateCaches.Load(toAddrPortKey(remote))
 			require.True(t, ok)
 			require.Equal(t, srflx, cached)
 		}))
@@ -330,7 +978,7 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 			local.conn = &fakenet.MockPacketConn{}
 			agent.localCandidates[local.NetworkType()] = []Candidate{local}
 
-			remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+			remote := netip.MustParseAddrPort("172.17.0.3:999")
 			msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
 				stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
 				UseCandidate(),
@@ -377,7 +1025,7 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 			require.Equal(t, relay, updatedPair.Remote)
 			require.Equal(t, oldPriority, updatedPair.priority())
 			require.Equal(t, prflx, pair.Remote)
-			cached, ok := local.remoteCandidateCaches.Load(toAddrPort(remote))
+			cached, ok := local.remoteCandidateCaches.Load(toAddrPortKey(remote))
 			require.True(t, ok)
 			require.Equal(t, relay, cached)
 		}))
@@ -476,10 +1124,8 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 			local, err := NewCandidateHost(&hostConfig)
 			require.NoError(t, err)
 
-			remote := &BadAddr{}
-
 			// nolint: contextcheck
-			agent.handleInbound(nil, local, remote)
+			agent.handleInbound(nil, local, netip.AddrPort{})
 			require.Len(t, agent.remoteCandidates, 0)
 		}))
 	})
@@ -506,7 +1152,7 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 			local.conn = &fakenet.MockPacketConn{}
 			require.NoError(t, err)
 
-			remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+			remote := netip.MustParseAddrPort("172.17.0.3:999")
 
 			msg, err := stun.Build(stun.BindingRequest, stun.TransactionID,
 				stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
@@ -537,7 +1183,7 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 			tID := [stun.TransactionIDSize]byte{}
 			copy(tID[:], "ABC")
 			agent.pendingBindingRequests = []bindingRequest{
-				{time.Now(), tID, &net.UDPAddr{}, false, nil},
+				{timestamp: time.Now(), transactionID: tID, destination: netip.AddrPort{}},
 			}
 
 			hostConfig := CandidateHostConfig{
@@ -550,7 +1196,7 @@ func TestHandlePeerReflexive(t *testing.T) { //nolint:cyclop,maintidx
 			local.conn = &fakenet.MockPacketConn{}
 			require.NoError(t, err)
 
-			remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+			remote := netip.MustParseAddrPort("172.17.0.3:999")
 			msg, err := stun.Build(stun.BindingSuccess, stun.NewTransactionIDSetter(tID),
 				stun.NewShortTermIntegrity(agent.remotePwd),
 				stun.Fingerprint,
@@ -734,11 +1380,12 @@ func TestConnectivityLite(t *testing.T) {
 		Proto:  stun.ProtoTypeUDP,
 	}
 
-	natType := &vnet.NATType{
+	fullAgentNATType := &vnet.NATType{
 		MappingBehavior:   vnet.EndpointIndependent,
 		FilteringBehavior: vnet.EndpointIndependent,
 	}
-	vent, err := buildVNet(natType, natType)
+	liteAgentNATType := &vnet.NATType{Mode: vnet.NATModeNAT1To1}
+	vent, err := buildVNet(fullAgentNATType, liteAgentNATType)
 	require.NoError(t, err, "should succeed")
 	defer vent.close()
 
@@ -766,6 +1413,7 @@ func TestConnectivityLite(t *testing.T) {
 		NetworkTypes:     supportedNetworkTypes(),
 		MulticastDNSMode: MulticastDNSModeDisabled,
 		Net:              vent.net1,
+		NAT1To1IPs:       []string{vnetGlobalIPB},
 	}
 
 	bAgent, err := NewAgent(cfg1)
@@ -775,12 +1423,81 @@ func TestConnectivityLite(t *testing.T) {
 	}()
 	require.NoError(t, bAgent.OnConnectionStateChange(bNotifier))
 
-	connectWithVNet(t, aAgent, bAgent)
+	connectWithVNet(t, bAgent, aAgent)
 
 	// Ensure pair selected
 	// Note: this assumes ConnectionStateConnected is thrown after selecting the final pair
 	<-aConnected
 	<-bConnected
+}
+
+// TestLiteAgentDoesNotSendConnectivityChecks verifies that an ICE-lite agent
+// responds to checks from a full agent without originating checks itself.
+func TestLiteAgentDoesNotSendConnectivityChecks(t *testing.T) {
+	defer test.CheckRoutines(t)()
+
+	fullAgentNATType := &vnet.NATType{
+		MappingBehavior:   vnet.EndpointIndependent,
+		FilteringBehavior: vnet.EndpointIndependent,
+	}
+	liteAgentNATType := &vnet.NATType{Mode: vnet.NATModeNAT1To1}
+	virtualNet, err := buildVNet(fullAgentNATType, liteAgentNATType)
+	require.NoError(t, err)
+	defer virtualNet.close()
+
+	fullAgent, err := NewAgent(&AgentConfig{
+		Urls: []*stun.URI{{
+			Scheme: SchemeTypeSTUN,
+			Host:   vnetSTUNServerIP,
+			Port:   vnetSTUNServerPort,
+			Proto:  stun.ProtoTypeUDP,
+		}},
+		NetworkTypes:     supportedNetworkTypes(),
+		MulticastDNSMode: MulticastDNSModeDisabled,
+		Net:              virtualNet.net0,
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, fullAgent.Close()) }()
+
+	liteAgent, err := NewAgent(&AgentConfig{
+		Lite:             true,
+		CandidateTypes:   []CandidateType{CandidateTypeHost},
+		NetworkTypes:     supportedNetworkTypes(),
+		MulticastDNSMode: MulticastDNSModeDisabled,
+		Net:              virtualNet.net1,
+		NAT1To1IPs:       []string{vnetGlobalIPB},
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, liteAgent.Close()) }()
+
+	fullUfrag, fullPwd, err := fullAgent.GetLocalUserCredentials()
+	require.NoError(t, err)
+	liteUfrag, litePwd, err := liteAgent.GetLocalUserCredentials()
+	require.NoError(t, err)
+	gatherAndExchangeCandidates(t, fullAgent, liteAgent)
+
+	_, err = liteAgent.StartAccept(fullUfrag, fullPwd)
+	require.NoError(t, err)
+	_, err = fullAgent.StartDial(liteUfrag, litePwd)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, fullAgent.AwaitConnect(ctx))
+	require.NoError(t, liteAgent.AwaitConnect(ctx))
+
+	var fullRequestsSent, liteRequestsReceived, liteRequestsSent uint64
+	for _, stats := range fullAgent.GetCandidatePairsStats() {
+		fullRequestsSent += stats.RequestsSent
+	}
+	for _, stats := range liteAgent.GetCandidatePairsStats() {
+		liteRequestsReceived += stats.RequestsReceived
+		liteRequestsSent += stats.RequestsSent
+	}
+
+	require.NotZero(t, fullRequestsSent)
+	require.NotZero(t, liteRequestsReceived)
+	require.Zero(t, liteRequestsSent)
 }
 
 func TestInboundValidity(t *testing.T) { //nolint:cyclop
@@ -797,7 +1514,7 @@ func TestInboundValidity(t *testing.T) { //nolint:cyclop
 		return msg
 	}
 
-	remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+	remote := netip.MustParseAddrPort("172.17.0.3:999")
 	hostConfig := CandidateHostConfig{
 		Network:   "udp",
 		Address:   "192.168.0.2",
@@ -899,7 +1616,7 @@ func TestInboundValidity(t *testing.T) { //nolint:cyclop
 		local.conn = &fakenet.MockPacketConn{}
 		require.NoError(t, err)
 
-		remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+		remote := netip.MustParseAddrPort("172.17.0.3:999")
 		tID := [stun.TransactionIDSize]byte{}
 		copy(tID[:], "ABC")
 		msg, err := stun.Build(stun.BindingSuccess, stun.NewTransactionIDSetter(tID),
@@ -944,7 +1661,7 @@ func TestHandleInboundAdditionalCases(t *testing.T) {
 		}
 		remoteCandidate, err := NewCandidateHost(remoteConfig)
 		require.NoError(t, err)
-		remoteAddr := &net.UDPAddr{IP: net.ParseIP(remoteCandidate.Address()), Port: remoteCandidate.Port()}
+		remoteAddr := remoteCandidate.addrPort()
 
 		require.NoError(t, agent.loop.Run(agent.loop, func(_ context.Context) {
 			agent.addRemoteCandidate(remoteCandidate) //nolint:contextcheck
@@ -967,7 +1684,7 @@ func TestHandleInboundAdditionalCases(t *testing.T) {
 
 		local := newHostLocal(t)
 		local.conn = &fakenet.MockPacketConn{}
-		remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+		remote := netip.MustParseAddrPort("172.17.0.3:999")
 		selector := &recordingSelector{}
 		agent.selector = selector
 		agent.isControlling.Store(true)
@@ -1000,7 +1717,7 @@ func TestHandleInboundAdditionalCases(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		agent.handleInbound(msg, local, &BadAddr{})
+		agent.handleInbound(msg, local, netip.AddrPort{})
 		require.Len(t, agent.remoteCandidates, 0)
 	})
 
@@ -1017,7 +1734,7 @@ func TestHandleInboundAdditionalCases(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		remote := &net.UDPAddr{IP: net.ParseIP("172.17.0.3"), Port: 999}
+		remote := netip.MustParseAddrPort("172.17.0.3:999")
 		agent.handleInbound(msg, nil, remote)
 		require.Len(t, agent.remoteCandidates, 0)
 	})
@@ -1037,7 +1754,7 @@ func TestHandleInboundAdditionalCases(t *testing.T) {
 		}
 		remoteCandidate, err := NewCandidateHost(remoteConfig)
 		require.NoError(t, err)
-		remoteAddr := &net.UDPAddr{IP: net.ParseIP(remoteCandidate.Address()), Port: remoteCandidate.Port()}
+		remoteAddr := remoteCandidate.addrPort()
 		transactionID := stun.NewTransactionID()
 		remotePwd := "remotekey"
 
@@ -1050,6 +1767,7 @@ func TestHandleInboundAdditionalCases(t *testing.T) {
 				timestamp:     time.Now(),
 				transactionID: transactionID,
 				destination:   remoteAddr,
+				networkType:   remoteCandidate.NetworkType(),
 			}}
 			agent.remotePwd = remotePwd
 		}))
@@ -1093,7 +1811,7 @@ func TestHandleInboundAdditionalCases(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		remote := &net.UDPAddr{IP: net.IPv4(172, 17, 0, 44), Port: 9999}
+		remote := netip.AddrPortFrom(netip.AddrFrom4([4]byte{172, 17, 0, 44}), 9999)
 		agent.handleInbound(msg, local, remote)
 
 		require.False(t, selector.handledBindingRequest)
@@ -1129,7 +1847,7 @@ func TestHandleInboundAdditionalCases(t *testing.T) {
 		require.NoError(t, err)
 
 		remote := &net.UDPAddr{IP: net.IPv4(172, 17, 0, 45), Port: 9999}
-		agent.handleInbound(msg, local, remote)
+		agent.handleInbound(msg, local, remote.AddrPort())
 
 		require.Equal(t, 1, filterCalls)
 		require.False(t, selector.handledBindingRequest)
@@ -1707,8 +2425,8 @@ func TestAgentCredentials(t *testing.T) {
 	defer func() {
 		require.NoError(t, agent.Close())
 	}()
-	require.GreaterOrEqual(t, len([]rune(agent.localUfrag))*8, 24)
-	require.GreaterOrEqual(t, len([]rune(agent.localPwd))*8, 128)
+	require.GreaterOrEqual(t, len([]rune(agent.localUfrag)), minLenUFrag)
+	require.GreaterOrEqual(t, len([]rune(agent.localPwd)), minLenPwd)
 
 	// Should honor RFC standards
 	// Local values MUST be unguessable, with at least 128 bits of

@@ -7,6 +7,7 @@ package ice
 
 import (
 	"context"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -191,52 +192,52 @@ func stressDuplex(t *testing.T) {
 	require.NoError(t, test.StressDuplex(ca, cb, opt))
 }
 
-func gatherAndExchangeCandidates(t *testing.T, aAgent, bAgent *Agent) {
-	t.Helper()
+func gatherAndExchangeCandidates(tb testing.TB, aAgent, bAgent *Agent) {
+	tb.Helper()
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	require.NoError(t, aAgent.OnCandidate(func(candidate Candidate) {
+	require.NoError(tb, aAgent.OnCandidate(func(candidate Candidate) {
 		if candidate == nil {
 			wg.Done()
 		}
 	}))
-	require.NoError(t, aAgent.GatherCandidates())
+	require.NoError(tb, aAgent.GatherCandidates())
 
-	require.NoError(t, bAgent.OnCandidate(func(candidate Candidate) {
+	require.NoError(tb, bAgent.OnCandidate(func(candidate Candidate) {
 		if candidate == nil {
 			wg.Done()
 		}
 	}))
-	require.NoError(t, bAgent.GatherCandidates())
+	require.NoError(tb, bAgent.GatherCandidates())
 
 	wg.Wait()
 
 	candidates, err := aAgent.GetLocalCandidates()
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	for _, c := range candidates {
 		if addr, parseErr := netip.ParseAddr(c.Address()); parseErr == nil {
-			require.False(t, shouldFilterLocationTrackedIP(addr))
+			require.False(tb, shouldFilterLocationTrackedIP(addr))
 		}
 		candidateCopy, copyErr := c.copy()
-		require.NoError(t, copyErr)
-		require.NoError(t, bAgent.AddRemoteCandidate(candidateCopy))
+		require.NoError(tb, copyErr)
+		require.NoError(tb, bAgent.AddRemoteCandidate(candidateCopy))
 	}
 
 	candidates, err = bAgent.GetLocalCandidates()
 
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	for _, c := range candidates {
 		candidateCopy, copyErr := c.copy()
-		require.NoError(t, copyErr)
-		require.NoError(t, aAgent.AddRemoteCandidate(candidateCopy))
+		require.NoError(tb, copyErr)
+		require.NoError(tb, aAgent.AddRemoteCandidate(candidateCopy))
 	}
 }
 
-func connect(t *testing.T, aAgent, bAgent *Agent) (*Conn, *Conn) {
-	t.Helper()
-	gatherAndExchangeCandidates(t, aAgent, bAgent)
+func connect(tb testing.TB, aAgent, bAgent *Agent) (*Conn, *Conn) {
+	tb.Helper()
+	gatherAndExchangeCandidates(tb, aAgent, bAgent)
 
 	accepted := make(chan struct{})
 	var aConn *Conn
@@ -244,15 +245,15 @@ func connect(t *testing.T, aAgent, bAgent *Agent) (*Conn, *Conn) {
 	go func() {
 		var acceptErr error
 		bUfrag, bPwd, acceptErr := bAgent.GetLocalUserCredentials()
-		require.NoError(t, acceptErr)
+		require.NoError(tb, acceptErr)
 		aConn, acceptErr = aAgent.Accept(context.TODO(), bUfrag, bPwd)
-		require.NoError(t, acceptErr)
+		require.NoError(tb, acceptErr)
 		close(accepted)
 	}()
 	aUfrag, aPwd, err := aAgent.GetLocalUserCredentials()
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	bConn, err := bAgent.Dial(context.TODO(), aUfrag, aPwd)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	// Ensure accepted
 	<-accepted
@@ -260,8 +261,8 @@ func connect(t *testing.T, aAgent, bAgent *Agent) (*Conn, *Conn) {
 	return aConn, bConn
 }
 
-func pipe(t *testing.T, defaultConfig *AgentConfig) (*Conn, *Conn) {
-	t.Helper()
+func pipe(tb testing.TB, defaultConfig *AgentConfig) (*Conn, *Conn) {
+	tb.Helper()
 	var urls []*stun.URI
 
 	aNotifier, aConnected := onConnected()
@@ -273,24 +274,26 @@ func pipe(t *testing.T, defaultConfig *AgentConfig) (*Conn, *Conn) {
 	}
 
 	cfg.Urls = urls
-	cfg.NetworkTypes = supportedNetworkTypes()
+	if cfg.NetworkTypes == nil {
+		cfg.NetworkTypes = supportedNetworkTypes()
+	}
 
 	aAgent, err := NewAgent(cfg)
-	require.NoError(t, err)
-	require.NoError(t, aAgent.OnConnectionStateChange(aNotifier))
-	t.Cleanup(func() {
-		require.NoError(t, aAgent.Close())
+	require.NoError(tb, err)
+	require.NoError(tb, aAgent.OnConnectionStateChange(aNotifier))
+	tb.Cleanup(func() {
+		require.NoError(tb, aAgent.Close())
 	})
 
 	bAgent, err := NewAgent(cfg)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
-	require.NoError(t, bAgent.OnConnectionStateChange(bNotifier))
-	t.Cleanup(func() {
-		require.NoError(t, bAgent.Close())
+	require.NoError(tb, bAgent.OnConnectionStateChange(bNotifier))
+	tb.Cleanup(func() {
+		require.NoError(tb, bAgent.Close())
 	})
 
-	aConn, bConn := connect(t, aAgent, bAgent)
+	aConn, bConn := connect(tb, aAgent, bAgent)
 
 	// Ensure pair selected
 	// Note: this assumes ConnectionStateConnected is thrown after selecting the final pair
@@ -348,17 +351,14 @@ func onConnected() (func(ConnectionState), chan struct{}) {
 	}, done
 }
 
-func randomPort(tb testing.TB) int {
+// portFromAddr returns the port of a bound socket address, so tests can bind
+// to port 0 and read the assigned port back instead of guessing a free one.
+func portFromAddr(tb testing.TB, addr net.Addr) int {
 	tb.Helper()
-	conn, err := net.ListenPacket("udp4", "127.0.0.1:0") // nolint: noctx
-	if err != nil {
-		tb.Fatalf("failed to pickPort: %v", err)
-	}
-	defer func() {
-		_ = conn.Close()
-	}()
-	switch addr := conn.LocalAddr().(type) {
+	switch addr := addr.(type) {
 	case *net.UDPAddr:
+		return addr.Port
+	case *net.TCPAddr:
 		return addr.Port
 	default:
 		tb.Fatalf("unknown addr type %T", addr)
@@ -441,6 +441,38 @@ func TestConn_Write_RejectsSTUN(t *testing.T) {
 	n, werr := c.Write(msg.Raw)
 	require.Zero(t, n)
 	require.ErrorIs(t, werr, errWriteSTUNMessageToIceConn)
+}
+
+func TestStartDialConnWriteBeforeConnectReturnsError(t *testing.T) {
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(10 * time.Second).Stop()
+
+	cfg := &AgentConfig{
+		NetworkTypes:     supportedNetworkTypes(),
+		MulticastDNSMode: MulticastDNSModeDisabled,
+	}
+	agent, err := NewAgent(cfg)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, agent.Close())
+	}()
+
+	b, err := NewAgent(cfg)
+	require.NoError(t, err)
+	defer func() {
+		require.NoError(t, b.Close())
+	}()
+
+	bUfrag, bPwd, err := b.GetLocalUserCredentials()
+	require.NoError(t, err)
+
+	conn, err := agent.StartDial(bUfrag, bPwd)
+	require.NoError(t, err)
+
+	n, werr := conn.Write([]byte("early application data"))
+	require.Zero(t, n)
+	require.ErrorIs(t, werr, ErrNoCandidatePairs)
+	require.Zero(t, conn.BytesSent())
 }
 
 func TestConn_GetCandidatePairsInfo(t *testing.T) {
@@ -632,4 +664,183 @@ func TestConn_WriteToPair_Success(t *testing.T) {
 	n, err = cb.Read(buf)
 	require.NoError(t, err)
 	require.Equal(t, testData, buf[:n])
+}
+
+// TestUDPConnReadWriteDoesNotAllocate pins the data path at zero heap
+// allocations per packet in both directions: Conn.Write on one agent through
+// real UDP sockets to Conn.Read on the other.
+func TestUDPConnReadWriteDoesNotAllocate(t *testing.T) {
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(30 * time.Second).Stop()
+
+	ca, cb := pipe(t, &AgentConfig{NetworkTypes: []NetworkType{NetworkTypeUDP4}})
+	defer closePipe(t, ca, cb)
+
+	packet := make([]byte, 1200)
+	readBuf := make([]byte, receiveMTU)
+
+	// Note: the read must stay synchronous with the write so the receive path
+	// runs exactly once per iteration; AllocsPerRun counts process-wide.
+	var failure error
+	roundTrip := func() {
+		if _, err := ca.Write(packet); err != nil && failure == nil {
+			failure = err
+		}
+		if _, err := cb.Read(readBuf); err != nil && failure == nil {
+			failure = err
+		}
+	}
+
+	// The first packets take slow paths that allocate (source validation and
+	// address registration); warm up so the measured loop runs steady state.
+	for range 100 {
+		roundTrip()
+	}
+	require.NoError(t, failure)
+
+	allocs := testing.AllocsPerRun(1000, roundTrip)
+	require.NoError(t, failure)
+	require.Zero(t, allocs)
+	require.Positive(t, ca.BytesSent())
+	require.Positive(t, cb.BytesReceived())
+}
+
+// discardPacketConn exercises the net.Addr fallback by implementing
+// a simple black-hole writer that only supports WriteTo.
+type discardPacketConn struct {
+	deadlinePacketConn
+}
+
+func (*discardPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
+	return len(b), nil
+}
+
+// addrPortCapablePacketConn is a black-hole writer that implements
+// support for the netip.AddrPort read/write variants.
+type addrPortCapablePacketConn struct {
+	deadlinePacketConn
+	writeToCalled         bool
+	writeToAddrPortCalled bool
+}
+
+func (c *addrPortCapablePacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
+	c.writeToCalled = true
+
+	return len(b), nil
+}
+
+func (*addrPortCapablePacketConn) ReadFromAddrPort([]byte) (int, netip.AddrPort, error) {
+	return 0, netip.AddrPort{}, io.EOF
+}
+
+func (c *addrPortCapablePacketConn) WriteToAddrPort(b []byte, _ netip.AddrPort) (int, error) {
+	c.writeToAddrPortCalled = true
+
+	return len(b), nil
+}
+
+// addrPortTCPMux simulates a custom TCPMux that returns PacketConns supporting
+// AddrPortReaderWriter.
+type addrPortTCPMux struct {
+	conn net.PacketConn
+}
+
+func (*addrPortTCPMux) Close() error             { return nil }
+func (*addrPortTCPMux) RemoveConnByUfrag(string) {}
+func (m *addrPortTCPMux) GetConnByUfrag(string, bool, net.IP) (net.PacketConn, error) {
+	return m.conn, nil
+}
+
+// TestConnWriteDoesNotAllocateOverStandardPacketConn pins Conn.Write at zero
+// heap allocations per packet, at least in this package, when the candidate's
+// PacketConn does not support netip.AddrPort writes. The write must reuse the
+// candidate's cached net.Addr rather than synthesizing a *net.UDPAddr from a
+// netip.AddrPort on every write.
+// Note that the *net.UDPConn implementation of WriteTo does allocate internally,
+// so a mock connection is used to isolate allocations to this package.
+func TestConnWriteDoesNotAllocateOverStandardPacketConn(t *testing.T) {
+	_, supportsAddrPort := any(&discardPacketConn{}).(AddrPortReaderWriter)
+	require.False(t, supportsAddrPort, "discardPacketConn must be a standard-only PacketConn")
+
+	agent, err := NewAgent(&AgentConfig{})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, agent.Close())
+	})
+
+	newCandidate := func(port int) *CandidateHost {
+		candidate, err := NewCandidateHost(&CandidateHostConfig{
+			Network:   "udp",
+			Address:   "192.0.2.1",
+			Port:      port,
+			Component: ComponentRTP,
+		})
+		require.NoError(t, err)
+
+		return candidate
+	}
+	local, remote := newCandidate(19000), newCandidate(19001)
+	local.conn = &discardPacketConn{}
+
+	agent.selectedPair.Store(newCandidatePair(local, remote, false))
+
+	conn := &Conn{agent: agent}
+	packet := make([]byte, 1200)
+
+	var writeErr error
+	allocs := testing.AllocsPerRun(1000, func() {
+		if _, err := conn.Write(packet); err != nil {
+			writeErr = err
+		}
+	})
+
+	require.NoError(t, writeErr)
+	require.Zero(t, allocs)
+	require.Positive(t, conn.BytesSent())
+}
+
+// TestCustomTCPMuxAddrPortCapability verifies that TCP candidates use
+// netip.AddrPort methods exposed by a custom mux.
+func TestCustomTCPMuxAddrPortCapability(t *testing.T) {
+	packetConn := &addrPortCapablePacketConn{}
+	mux := &addrPortTCPMux{conn: packetConn}
+	conn, err := mux.GetConnByUfrag("ufrag", false, net.IPv4(127, 0, 0, 1))
+	require.NoError(t, err)
+
+	addrPortConn, ok := conn.(AddrPortReaderWriter)
+	require.True(t, ok)
+
+	local := &candidateBase{
+		networkType:  NetworkTypeTCP4,
+		conn:         conn,
+		addrPortConn: addrPortConn,
+	}
+
+	remote := &candidateBase{}
+	remote.setResolvedAddr(&net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 5000})
+
+	_, err = local.writeTo([]byte("framed"), remote)
+	require.NoError(t, err)
+	require.True(t, packetConn.writeToAddrPortCalled)
+	require.False(t, packetConn.writeToCalled)
+}
+
+func BenchmarkUDPConnWriteRead(b *testing.B) {
+	ca, cb := pipe(b, &AgentConfig{NetworkTypes: []NetworkType{NetworkTypeUDP4}})
+	defer closePipe(b, ca, cb)
+
+	// Note: this loop needs to keep the writes and reads synchronous to keep
+	// the allocation benchmark deterministic. Otherwise, if reads fall behind
+	// writes and packets get dropped, the allocations could get underreported.
+	packet := make([]byte, 1200)
+	readBuf := make([]byte, 2000)
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := ca.Write(packet); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := cb.Read(readBuf); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

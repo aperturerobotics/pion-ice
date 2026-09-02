@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	"github.com/pion/logging"
 	"github.com/pion/stun/v3"
 	"github.com/pion/transport/v4/test"
+	"github.com/pion/transport/v4/vnet"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -30,6 +32,12 @@ const (
 	selectionTestRemoteUfrag = "remote"
 	selectionTestLocalUfrag  = "local"
 )
+
+type stunSetterFunc func(*stun.Message) error
+
+func (f stunSetterFunc) AddTo(m *stun.Message) error {
+	return f(m)
+}
 
 func sendUntilDone(t *testing.T, writingConn, readingConn net.Conn, maxAttempts int) bool {
 	t.Helper()
@@ -141,8 +149,10 @@ func TestBindingRequestHandler(t *testing.T) {
 	assert.NotNil(t, candidatePair)
 	assert.NoError(t, err)
 
-	// Sending will fail, we no longer have a selected candidate pair
-	require.False(t, sendUntilDone(t, controlledConn, controllingConn, 20))
+	// Sending will fail, we no longer have a selected candidate pair.
+	n, writeErr := controlledConn.Write([]byte("Hello World"))
+	require.Zero(t, n)
+	require.ErrorIs(t, writeErr, ErrNoCandidatePairs)
 
 	// Send STUN Binding requests until a new Selected Candidate Pair has been set by BindingRequestHandler
 	switchToNewCandidatePair.Store(true)
@@ -363,9 +373,172 @@ func TestControlledSelector_HandleSuccessResponse_UnknownTxID(t *testing.T) {
 	var m stun.Message
 	copy(m.TransactionID[:], []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12})
 
-	sel.HandleSuccessResponse(&m, local, remote, nil)
+	sel.HandleSuccessResponse(&m, local, remote, netip.AddrPort{})
 
 	require.True(t, logger.warned, "expected Warnf to be called for unknown TransactionID (hitting !ok branch)")
+}
+
+// TestResponseSymmetric covers the RFC 8445 §7.2.5.2.1 transport-address check.
+// A success response is symmetric only when it arrives on the same transport the
+// request was sent over (networkType) and from the same address it was sent to.
+func TestResponseSymmetric(t *testing.T) {
+	local := func(nt NetworkType) Candidate {
+		c := newPingNoIOCand()
+		c.candidateBase.networkType = nt
+
+		return c
+	}
+	mk := func(addr string, port uint16) netip.AddrPort {
+		return netip.AddrPortFrom(netip.MustParseAddr(addr), port)
+	}
+
+	tests := []struct {
+		name       string
+		reqNetwork NetworkType
+		localNT    NetworkType
+		dest       netip.AddrPort
+		remoteAddr netip.AddrPort
+		want       bool
+	}{
+		{
+			name:       "matching transport and address",
+			reqNetwork: NetworkTypeUDP4, localNT: NetworkTypeUDP4,
+			dest: mk("192.168.1.2", 20000), remoteAddr: mk("192.168.1.2", 20000),
+			want: true,
+		},
+		{
+			// netip.AddrPort carries no transport, so the network-type check is
+			// what rejects a response that arrived on a different transport.
+			name:       "network type mismatch",
+			reqNetwork: NetworkTypeUDP6, localNT: NetworkTypeUDP4,
+			dest: mk("2001:db8::2", 20000), remoteAddr: mk("2001:db8::2", 20000),
+			want: false,
+		},
+		{
+			name:       "source address mismatch",
+			reqNetwork: NetworkTypeUDP4, localNT: NetworkTypeUDP4,
+			dest: mk("192.168.1.2", 20000), remoteAddr: mk("192.168.1.9", 20000),
+			want: false,
+		},
+		{
+			name:       "source port mismatch",
+			reqNetwork: NetworkTypeUDP4, localNT: NetworkTypeUDP4,
+			dest: mk("192.168.1.2", 20000), remoteAddr: mk("192.168.1.2", 20001),
+			want: false,
+		},
+		{
+			name:       "IPv4-in-IPv6 source form still matches",
+			reqNetwork: NetworkTypeUDP4, localNT: NetworkTypeUDP4,
+			dest: mk("192.168.1.2", 20000), remoteAddr: mk("::ffff:192.168.1.2", 20000),
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &bindingRequest{destination: tt.dest, networkType: tt.reqNetwork}
+			require.Equal(t, tt.want, responseSymmetric(req, local(tt.localNT), tt.remoteAddr))
+		})
+	}
+}
+
+// TestHandleSuccessResponse_AsymmetricDiscarded verifies that HandleSuccessResponse
+// honors the symmetry check: a success response with a known TransactionID but a
+// mismatched transport (different network type or source address) is discarded and
+// does not mark the pair succeeded.
+func TestHandleSuccessResponse_AsymmetricDiscarded(t *testing.T) {
+	newAgent := func(t *testing.T) (*Agent, *controllingSelector) {
+		t.Helper()
+		agent := bareAgentForPing()
+		agent.log = logging.NewDefaultLoggerFactory().NewLogger("test")
+		agent.remoteUfrag = selectionTestRemoteUfrag
+		agent.localUfrag = selectionTestLocalUfrag
+		agent.remotePwd = selectionTestPassword
+		agent.tieBreaker = 1
+		agent.isControlling.Store(true)
+		agent.onConnected = make(chan struct{})
+		agent.setSelector()
+
+		selector, ok := agent.getSelector().(*controllingSelector)
+		require.True(t, ok, "expected controllingSelector")
+
+		return agent, selector
+	}
+	newCand := func(nt NetworkType, ip string, port int) *pingNoIOCand {
+		c := newPingNoIOCand()
+		c.candidateBase.networkType = nt
+		c.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP(ip), Port: port})
+
+		return c
+	}
+	// sendRequest registers a pending binding request for (local, remote) and
+	// returns the matching success response.
+	sendRequest := func(t *testing.T, agent *Agent, local, remote Candidate) *stun.Message {
+		t.Helper()
+		req, err := stun.Build(stun.BindingRequest,
+			stun.TransactionID,
+			stun.NewUsername(agent.remoteUfrag+":"+agent.localUfrag),
+			AttrControlling(agent.tieBreaker),
+			PriorityAttr(local.Priority()),
+			stun.NewShortTermIntegrity(agent.remotePwd),
+			stun.Fingerprint,
+		)
+		require.NoError(t, err)
+		agent.sendBindingRequest(req, local, remote)
+
+		resp, err := stun.Build(req, stun.BindingSuccess,
+			stun.NewShortTermIntegrity(agent.remotePwd),
+			stun.Fingerprint,
+		)
+		require.NoError(t, err)
+
+		return resp
+	}
+
+	t.Run("network type mismatch is discarded", func(t *testing.T) {
+		agent, selector := newAgent(t)
+		local := newCand(NetworkTypeUDP4, "192.168.1.1", 10000)
+		remote := newCand(NetworkTypeUDP6, "2001:db8::2", 20000)
+		pair := agent.addPair(local, remote)
+		pair.state = CandidatePairStateInProgress
+
+		resp := sendRequest(t, agent, local, remote)
+		selector.HandleSuccessResponse(resp, local, remote, remote.addrPort())
+
+		require.Equal(t, CandidatePairStateInProgress, pair.state,
+			"pair must not be marked succeeded when the response transport does not match")
+		require.Nil(t, agent.getSelectedPair())
+	})
+
+	t.Run("source address mismatch is discarded", func(t *testing.T) {
+		agent, selector := newAgent(t)
+		local := newCand(NetworkTypeUDP4, "192.168.1.1", 10000)
+		remote := newCand(NetworkTypeUDP4, "192.168.1.2", 20000)
+		pair := agent.addPair(local, remote)
+		pair.state = CandidatePairStateInProgress
+
+		resp := sendRequest(t, agent, local, remote)
+		wrongSrc := netip.AddrPortFrom(netip.MustParseAddr("192.168.1.9"), 20000)
+		selector.HandleSuccessResponse(resp, local, remote, wrongSrc)
+
+		require.Equal(t, CandidatePairStateInProgress, pair.state,
+			"pair must not be marked succeeded when the response source does not match")
+		require.Nil(t, agent.getSelectedPair())
+	})
+
+	t.Run("matching transport is accepted", func(t *testing.T) {
+		agent, selector := newAgent(t)
+		local := newCand(NetworkTypeUDP4, "192.168.1.1", 10000)
+		remote := newCand(NetworkTypeUDP4, "192.168.1.2", 20000)
+		pair := agent.addPair(local, remote)
+		pair.state = CandidatePairStateInProgress
+
+		resp := sendRequest(t, agent, local, remote)
+		selector.HandleSuccessResponse(resp, local, remote, remote.addrPort())
+
+		require.Equal(t, CandidatePairStateSucceeded, pair.state,
+			"pair must be marked succeeded when the response transport matches")
+	})
 }
 
 // TestControlledSelector_NoTriggeredCheckAfterConnected verifies that once a pair
@@ -389,11 +562,11 @@ func TestControlledSelector_NoTriggeredCheckAfterConnected(t *testing.T) {
 
 	local := newPingNoIOCand()
 	local.candidateBase.networkType = NetworkTypeUDP4
-	local.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000}
+	local.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000})
 
 	remote := newPingNoIOCand()
 	remote.candidateBase.networkType = NetworkTypeUDP4
-	remote.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000}
+	remote.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000})
 
 	pair := agent.addPair(local, remote)
 	pair.state = CandidatePairStateSucceeded
@@ -440,11 +613,11 @@ func TestControlledSelector_TriggeredCheckDuringChecking(t *testing.T) {
 
 	local := newPingNoIOCand()
 	local.candidateBase.networkType = NetworkTypeUDP4
-	local.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000}
+	local.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000})
 
 	remote := newPingNoIOCand()
 	remote.candidateBase.networkType = NetworkTypeUDP4
-	remote.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000}
+	remote.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000})
 
 	pair := agent.addPair(local, remote)
 	// Pair is in Waiting state (not Succeeded), no selected pair — normal ICE checking.
@@ -888,15 +1061,15 @@ func TestKeepAliveCandidatesForRenomination(t *testing.T) {
 	createTestCandidates := func() (Candidate, Candidate, Candidate) {
 		local1 := newPingNoIOCand()
 		local1.candidateBase.networkType = NetworkTypeUDP4
-		local1.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000}
+		local1.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000})
 
 		local2 := newPingNoIOCand()
 		local2.candidateBase.networkType = NetworkTypeUDP4
-		local2.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001}
+		local2.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001})
 
 		remote := newPingNoIOCand()
 		remote.candidateBase.networkType = NetworkTypeUDP4
-		remote.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000}
+		remote.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000})
 
 		return local1, local2, remote
 	}
@@ -1074,15 +1247,15 @@ func TestRenominationAcceptance(t *testing.T) { //nolint:maintidx
 
 		local1 := newPingNoIOCand()
 		local1.candidateBase.networkType = NetworkTypeUDP4
-		local1.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000}
+		local1.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000})
 
 		local2 := newPingNoIOCand()
 		local2.candidateBase.networkType = NetworkTypeUDP4
-		local2.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001}
+		local2.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001})
 
 		remote := newPingNoIOCand()
 		remote.candidateBase.networkType = NetworkTypeUDP4
-		remote.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000}
+		remote.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000})
 
 		pair1 := agent.addPair(local1, remote)
 		pair1.state = CandidatePairStateSucceeded
@@ -1129,15 +1302,15 @@ func TestRenominationAcceptance(t *testing.T) { //nolint:maintidx
 		// Create two host candidates with same priority
 		local1 := newPingNoIOCand()
 		local1.candidateBase.networkType = NetworkTypeUDP4
-		local1.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000}
+		local1.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000})
 
 		local2 := newPingNoIOCand()
 		local2.candidateBase.networkType = NetworkTypeUDP4
-		local2.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001}
+		local2.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001})
 
 		remote := newPingNoIOCand()
 		remote.candidateBase.networkType = NetworkTypeUDP4
-		remote.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000}
+		remote.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000})
 
 		// Create two pairs with the same priority (both host candidates)
 		pair1 := agent.addPair(local1, remote)
@@ -1195,17 +1368,17 @@ func TestRenominationAcceptance(t *testing.T) { //nolint:maintidx
 		// Create candidates - we'll simulate lower priority by using different types
 		local1 := newPingNoIOCand()
 		local1.candidateBase.networkType = NetworkTypeUDP4
-		local1.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000}
+		local1.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000})
 		local1.candidateBase.candidateType = CandidateTypeHost // Higher priority
 
 		local2 := newPingNoIOCand()
 		local2.candidateBase.networkType = NetworkTypeUDP4
-		local2.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001}
+		local2.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001})
 		local2.candidateBase.candidateType = CandidateTypeHost // Same priority
 
 		remote := newPingNoIOCand()
 		remote.candidateBase.networkType = NetworkTypeUDP4
-		remote.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000}
+		remote.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000})
 		remote.candidateBase.candidateType = CandidateTypeHost
 
 		pair1 := agent.addPair(local1, remote)
@@ -1255,19 +1428,19 @@ func TestRenominationAcceptance(t *testing.T) { //nolint:maintidx
 
 		local1 := newPingNoIOCand()
 		local1.candidateBase.networkType = NetworkTypeUDP4
-		local1.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000}
+		local1.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000})
 
 		local2 := newPingNoIOCand()
 		local2.candidateBase.networkType = NetworkTypeUDP4
-		local2.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001}
+		local2.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001})
 
 		local3 := newPingNoIOCand()
 		local3.candidateBase.networkType = NetworkTypeUDP4
-		local3.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.4"), Port: 10002}
+		local3.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.4"), Port: 10002})
 
 		remote := newPingNoIOCand()
 		remote.candidateBase.networkType = NetworkTypeUDP4
-		remote.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000}
+		remote.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000})
 
 		pair1 := agent.addPair(local1, remote)
 		pair1.state = CandidatePairStateSucceeded
@@ -1343,15 +1516,15 @@ func TestControllingSideRenomination(t *testing.T) {
 		// Create two host candidates
 		local1 := newPingNoIOCand()
 		local1.candidateBase.networkType = NetworkTypeUDP4
-		local1.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000}
+		local1.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000})
 
 		local2 := newPingNoIOCand()
 		local2.candidateBase.networkType = NetworkTypeUDP4
-		local2.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001}
+		local2.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001})
 
 		remote := newPingNoIOCand()
 		remote.candidateBase.networkType = NetworkTypeUDP4
-		remote.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000}
+		remote.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000})
 
 		// Create two pairs
 		pair1 := agent.addPair(local1, remote)
@@ -1404,7 +1577,7 @@ func TestControllingSideRenomination(t *testing.T) {
 		require.NoError(t, err)
 
 		// Handle the success response - this should switch to pair2
-		selector.HandleSuccessResponse(successMsg, local2, remote, remote.addr())
+		selector.HandleSuccessResponse(successMsg, local2, remote, remote.addrPort())
 
 		// The controlling agent should have switched to pair2
 		selectedPair := agent.getSelectedPair()
@@ -1431,15 +1604,15 @@ func TestControllingSideRenomination(t *testing.T) {
 		// Create two host candidates
 		local1 := newPingNoIOCand()
 		local1.candidateBase.networkType = NetworkTypeUDP4
-		local1.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000}
+		local1.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000})
 
 		local2 := newPingNoIOCand()
 		local2.candidateBase.networkType = NetworkTypeUDP4
-		local2.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001}
+		local2.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.3"), Port: 10001})
 
 		remote := newPingNoIOCand()
 		remote.candidateBase.networkType = NetworkTypeUDP4
-		remote.candidateBase.resolvedAddr = &net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000}
+		remote.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000})
 
 		// Create two pairs
 		pair1 := agent.addPair(local1, remote)
@@ -1484,11 +1657,421 @@ func TestControllingSideRenomination(t *testing.T) {
 
 		// Handle the success response - this should NOT switch since it's standard nomination
 		// and a pair is already selected
-		selector.HandleSuccessResponse(successMsg, local2, remote, remote.addr())
+		selector.HandleSuccessResponse(successMsg, local2, remote, remote.addrPort())
 
 		// The controlling agent should remain with pair1
 		selectedPair := agent.getSelectedPair()
 		assert.Equal(t, pair1, selectedPair,
 			"Controlling agent should NOT switch with standard nomination when pair already selected")
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Lite mode tests
+// ---------------------------------------------------------------------------
+
+func TestLiteControllingSelectorContactCandidates(t *testing.T) {
+	agent := bareAgentForPing()
+	agent.log = logging.NewDefaultLoggerFactory().NewLogger("test")
+	agent.lite = true
+	agent.remoteLite = true
+	agent.isControlling.Store(true)
+	agent.onConnected = make(chan struct{})
+	agent.setSelector()
+
+	selector, ok := agent.getSelector().(*liteSelector)
+	require.True(t, ok)
+
+	selector.ContactCandidates()
+	require.Nil(t, agent.getSelectedPair())
+
+	pair := agent.addPair(newPingNoIOCand(), newPingNoIOCand())
+	selector.ContactCandidates()
+	require.Equal(t, pair, agent.getSelectedPair())
+	require.Equal(t, CandidatePairStateSucceeded, pair.state)
+	require.Zero(t, pair.RequestsSent())
+
+	selector.ContactCandidates()
+	require.Equal(t, pair, agent.getSelectedPair())
+}
+
+// TestLiteControlledSelector_NoPingCandidate verifies that a lite controlled
+// agent NEVER sends triggered connectivity checks (PingCandidate), regardless
+// of the pair state. Per RFC 8445 §7, a lite implementation only acts as a
+// STUN server and does not generate connectivity checks.
+func TestLiteControlledSelector_NoPingCandidate(t *testing.T) {
+	buildMsg := func(t *testing.T, a *Agent) *stun.Message {
+		t.Helper()
+		msg, err := stun.Build(stun.BindingRequest,
+			stun.TransactionID,
+			stun.NewUsername(a.localUfrag+":"+a.remoteUfrag),
+			stun.NewShortTermIntegrity(a.localPwd),
+			stun.Fingerprint,
+		)
+		require.NoError(t, err)
+
+		return msg
+	}
+
+	buildMalformedNominationMsg := func(t *testing.T, agent *Agent, useCandidate bool) *stun.Message {
+		t.Helper()
+
+		setters := []stun.Setter{
+			stun.BindingRequest,
+			stun.TransactionID,
+			stun.NewUsername(agent.localUfrag + ":" + agent.remoteUfrag),
+		}
+		if useCandidate {
+			setters = append(setters, UseCandidate())
+		}
+		setters = append(setters,
+			stunSetterFunc(func(m *stun.Message) error {
+				m.Add(agent.nominationAttribute, []byte{0x01, 0x02})
+
+				return nil
+			}),
+			stun.NewShortTermIntegrity(agent.localPwd),
+			stun.Fingerprint,
+		)
+
+		msg, err := stun.Build(setters...)
+		require.NoError(t, err)
+
+		return msg
+	}
+
+	setupAgent := func(t *testing.T) (*Agent, *pingNoIOCand, *pingNoIOCand, *CandidatePair) {
+		t.Helper()
+		liteAgent := bareAgentForPing()
+		liteAgent.log = logging.NewDefaultLoggerFactory().NewLogger("test")
+		liteAgent.remoteUfrag = selectionTestRemoteUfrag
+		liteAgent.localUfrag = selectionTestLocalUfrag
+		liteAgent.remotePwd = selectionTestPassword
+		liteAgent.localPwd = selectionTestPassword
+		liteAgent.tieBreaker = 1
+		liteAgent.lite = true
+		liteAgent.isControlling.Store(false)
+		liteAgent.onConnected = make(chan struct{})
+		liteAgent.setSelector()
+
+		local := newPingNoIOCand()
+		local.candidateBase.networkType = NetworkTypeUDP4
+		local.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.1"), Port: 10000})
+
+		remote := newPingNoIOCand()
+		remote.candidateBase.networkType = NetworkTypeUDP4
+		remote.candidateBase.setResolvedAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.2"), Port: 20000})
+
+		pair := liteAgent.addPair(local, remote)
+
+		return liteAgent, local, remote, pair
+	}
+
+	t.Run("ContactCandidatesDoesNotValidatePair", func(t *testing.T) {
+		agent, local, remote, pair := setupAgent(t)
+		selector := agent.getSelector()
+		selector.ContactCandidates()
+		selector.PingCandidate(local, remote)
+
+		require.Equal(t, CandidatePairStateWaiting, pair.state)
+		require.Zero(t, pair.RequestsSent())
+		require.Nil(t, agent.getSelectedPair())
+	})
+
+	t.Run("NoTriggeredCheckWhileChecking", func(t *testing.T) {
+		// Pair is in Waiting state (ICE checking phase). A full controlled agent
+		// would send a triggered check here; a lite one must not.
+		agent, local, remote, pair := setupAgent(t)
+
+		ls, ok := agent.getSelector().(*liteSelector)
+		require.True(t, ok, "expected liteSelector as top-level selector")
+		_, ok = ls.pairCandidateSelector.(*controlledSelector)
+		require.True(t, ok, "expected controlledSelector inside liteSelector")
+
+		sentBefore := pair.RequestsSent()
+		msg := buildMsg(t, agent)
+
+		for range 5 {
+			ls.HandleBindingRequest(msg, local, remote)
+		}
+
+		assert.Equal(t, sentBefore, pair.RequestsSent(),
+			"lite controlled agent must not send triggered checks during ICE checking")
+	})
+
+	t.Run("NoTriggeredCheckWhenSucceededAndSelected", func(t *testing.T) {
+		// Pair is Succeeded and selected. Even a full agent suppresses checks here,
+		// but we verify the lite path also stays clean.
+		agent, local, remote, pair := setupAgent(t)
+		pair.state = CandidatePairStateSucceeded
+		agent.setSelectedPair(pair)
+
+		ls, ok := agent.getSelector().(*liteSelector)
+		require.True(t, ok)
+
+		sentBefore := pair.RequestsSent()
+		msg := buildMsg(t, agent)
+		ls.HandleBindingRequest(msg, local, remote)
+
+		assert.Equal(t, sentBefore, pair.RequestsSent(),
+			"lite controlled agent must not send triggered checks when pair is connected")
+	})
+
+	t.Run("CustomHandlerSelectionPromotesPair", func(t *testing.T) {
+		agent, local, remote, pair := setupAgent(t)
+		require.Equal(t, CandidatePairStateWaiting, pair.state, "pair must start in Waiting")
+
+		ls, ok := agent.getSelector().(*liteSelector)
+		require.True(t, ok)
+
+		var handlerCalled bool
+		agent.userBindingRequestHandler = func(message *stun.Message, _, _ Candidate, handlerPair *CandidatePair) bool {
+			handlerCalled = true
+			assert.False(t, message.Contains(stun.AttrUseCandidate), "test must exercise an ordinary Binding request")
+			assert.Equal(t, pair, handlerPair)
+
+			return true
+		}
+
+		msg := buildMsg(t, agent)
+		ls.HandleBindingRequest(msg, local, remote)
+
+		assert.True(t, handlerCalled)
+		assert.Equal(t, pair, agent.getSelectedPair())
+		assert.Equal(t, CandidatePairStateSucceeded, pair.state)
+		assert.True(t, pair.nominated)
+		assert.Equal(t, uint64(0), pair.RequestsSent())
+	})
+
+	t.Run("NominationStillAccepted", func(t *testing.T) {
+		// RFC 8445 §7.3.2: the lite agent must accept USE-CANDIDATE and select the
+		// pair directly, even when the pair has never reached Succeeded state via a
+		// triggered check (which it never sends). Leave the pair in Waiting — the
+		// default after addPair — to exercise the lite direct-nomination path.
+		agent, local, remote, pair := setupAgent(t)
+		// Intentionally do NOT set pair.state = CandidatePairStateSucceeded.
+		// A lite agent never generates triggered checks, so the pair will never reach
+		// Succeeded that way. The nomination must be accepted regardless.
+		require.Equal(t, CandidatePairStateWaiting, pair.state, "pair must start in Waiting")
+
+		ls, ok := agent.getSelector().(*liteSelector)
+		require.True(t, ok)
+
+		assert.Nil(t, agent.getSelectedPair(), "no pair selected yet")
+
+		msg, err := stun.Build(stun.BindingRequest,
+			stun.TransactionID,
+			stun.NewUsername(agent.localUfrag+":"+agent.remoteUfrag),
+			UseCandidate(),
+			stun.NewShortTermIntegrity(agent.localPwd),
+			stun.Fingerprint,
+		)
+		require.NoError(t, err)
+
+		ls.HandleBindingRequest(msg, local, remote)
+
+		assert.Equal(t, pair, agent.getSelectedPair(),
+			"lite controlled agent must accept nomination even when pair has not reached Succeeded")
+		assert.Equal(t, CandidatePairStateSucceeded, pair.state)
+		assert.True(t, pair.nominated)
+		// Still no triggered check emitted
+		assert.Equal(t, uint64(0), pair.RequestsSent())
+	})
+
+	t.Run("MalformedNominationOnlyDoesNotNominate", func(t *testing.T) {
+		agent, local, remote, pair := setupAgent(t)
+		agent.nominationAttribute = stun.AttrType(0x0030)
+		require.Equal(t, CandidatePairStateWaiting, pair.state, "pair must start in Waiting")
+
+		ls, ok := agent.getSelector().(*liteSelector)
+		require.True(t, ok)
+
+		msg := buildMalformedNominationMsg(t, agent, false)
+		require.False(t, msg.Contains(stun.AttrUseCandidate), "test must not include USE-CANDIDATE")
+
+		ls.HandleBindingRequest(msg, local, remote)
+
+		require.Nil(t, agent.getSelectedPair())
+		assert.Equal(t, CandidatePairStateWaiting, pair.state)
+		assert.False(t, pair.nominated)
+		assert.False(t, pair.nominateOnBindingSuccess)
+		assert.Equal(t, uint16(0), pair.bindingRequestCount)
+		assert.Equal(t, uint64(0), pair.RequestsSent())
+	})
+
+	t.Run("UseCandidateWithMalformedNominationStillAccepted", func(t *testing.T) {
+		agent, local, remote, pair := setupAgent(t)
+		agent.nominationAttribute = stun.AttrType(0x0030)
+		require.Equal(t, CandidatePairStateWaiting, pair.state, "pair must start in Waiting")
+
+		ls, ok := agent.getSelector().(*liteSelector)
+		require.True(t, ok)
+
+		msg := buildMalformedNominationMsg(t, agent, true)
+		require.True(t, msg.Contains(stun.AttrUseCandidate), "test must include USE-CANDIDATE")
+
+		ls.HandleBindingRequest(msg, local, remote)
+
+		assert.Equal(t, pair, agent.getSelectedPair())
+		assert.Equal(t, CandidatePairStateSucceeded, pair.state)
+		assert.True(t, pair.nominated)
+		assert.Equal(t, uint16(0), pair.bindingRequestCount)
+		assert.Equal(t, uint64(0), pair.RequestsSent())
+	})
+}
+
+// TestLiteMode_FullToLite_Integration is an end-to-end test for the most common
+// lite mode deployment: a full ICE agent (controlling) connects to a lite agent
+// (controlled). The full agent performs connectivity checks and nominates; the
+// lite agent responds to STUN but never generates checks of its own.
+func TestLiteMode_FullToLite_Integration(t *testing.T) {
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(time.Second * 30).Stop()
+
+	oneHour := time.Hour
+	keepaliveInterval := time.Millisecond * 20
+
+	// Full agent — will become the controlling agent (Dial).
+	fullNotifier, fullConnected := onConnected()
+	fullAgent, err := NewAgent(&AgentConfig{
+		NetworkTypes:      []NetworkType{NetworkTypeUDP4},
+		MulticastDNSMode:  MulticastDNSModeDisabled,
+		KeepaliveInterval: &keepaliveInterval,
+		CheckInterval:     &oneHour,
+	})
+	require.NoError(t, err)
+	require.NoError(t, fullAgent.OnConnectionStateChange(fullNotifier))
+	t.Cleanup(func() { require.NoError(t, fullAgent.Close()) })
+
+	// Lite agent — will become the controlled agent (Accept).
+	liteNotifier, liteConnected := onConnected()
+	liteAgent, err := NewAgent(&AgentConfig{
+		NetworkTypes:      []NetworkType{NetworkTypeUDP4},
+		MulticastDNSMode:  MulticastDNSModeDisabled,
+		KeepaliveInterval: &keepaliveInterval,
+		CheckInterval:     &oneHour,
+		Lite:              true,
+		CandidateTypes:    []CandidateType{CandidateTypeHost},
+	})
+	require.NoError(t, err)
+	require.NoError(t, liteAgent.OnConnectionStateChange(liteNotifier))
+	t.Cleanup(func() { require.NoError(t, liteAgent.Close()) })
+
+	// connect() calls aAgent.Accept (controlled) and bAgent.Dial (controlling).
+	// To test the common full (controlling) -> lite (controlled) case, pass liteAgent
+	// as aAgent and fullAgent as bAgent.
+	liteConn, fullConn := connect(t, liteAgent, fullAgent)
+
+	<-fullConnected
+	<-liteConnected
+
+	// Verify the lite agent never sent its own connectivity checks.
+	err = liteAgent.loop.Run(liteAgent.loop, func(_ context.Context) {
+		for _, pair := range liteAgent.checklist {
+			assert.Equal(t, uint64(0), pair.RequestsSent(),
+				"lite agent must not send any connectivity checks")
+		}
+	})
+	require.NoError(t, err)
+
+	var selectedPairID uint64
+	err = liteAgent.loop.Run(liteAgent.loop, func(_ context.Context) {
+		selectedPair := liteAgent.getSelectedPair()
+		require.NotNil(t, selectedPair)
+		selectedPairID = selectedPair.id
+	})
+	require.NoError(t, err)
+
+	var foundSelectedPair bool
+	for _, info := range liteConn.GetCandidatePairsInfo() {
+		if info.ID != selectedPairID {
+			continue
+		}
+
+		foundSelectedPair = true
+		assert.Equal(t, CandidatePairStateSucceeded, info.State)
+		assert.True(t, info.Nominated)
+
+		break
+	}
+	require.True(t, foundSelectedPair, "selected lite pair must be reported")
+
+	testData := []byte("lite WriteToPair")
+	n, err := liteConn.WriteToPair(selectedPairID, testData)
+	require.NoError(t, err)
+	require.Equal(t, len(testData), n)
+
+	require.NoError(t, fullConn.SetReadDeadline(time.Now().Add(time.Second)))
+	buf := make([]byte, len(testData))
+	n, err = fullConn.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, testData, buf[:n])
+	require.NoError(t, fullConn.SetReadDeadline(time.Time{}))
+
+	// Both agents should be able to exchange data.
+	require.True(t, sendUntilDone(t, fullConn, liteConn, 100))
+	require.True(t, sendUntilDone(t, liteConn, fullConn, 120))
+
+	closePipe(t, liteConn, fullConn)
+}
+
+func TestLiteMode_LiteControlling_Integration(t *testing.T) {
+	defer test.CheckRoutines(t)()
+	defer test.TimeOut(30 * time.Second).Stop()
+
+	virtualNet, err := buildVNet(
+		&vnet.NATType{Mode: vnet.NATModeNAT1To1},
+		&vnet.NATType{Mode: vnet.NATModeNAT1To1},
+	)
+	require.NoError(t, err)
+	defer virtualNet.close()
+
+	newLiteAgent := func(network *vnet.Net, externalIP string) *Agent {
+		agent, newAgentErr := NewAgent(&AgentConfig{
+			Lite:             true,
+			CandidateTypes:   []CandidateType{CandidateTypeHost},
+			NetworkTypes:     []NetworkType{NetworkTypeUDP4},
+			MulticastDNSMode: MulticastDNSModeDisabled,
+			Net:              network,
+			NAT1To1IPs:       []string{externalIP},
+		})
+		require.NoError(t, newAgentErr)
+
+		return agent
+	}
+
+	controlledAgent := newLiteAgent(virtualNet.net0, vnetGlobalIPA)
+	defer func() { require.NoError(t, controlledAgent.Close()) }()
+	controllingAgent := newLiteAgent(virtualNet.net1, vnetGlobalIPB)
+	defer func() { require.NoError(t, controllingAgent.Close()) }()
+	require.NoError(t, controlledAgent.SetRemoteICELite(true))
+	require.NoError(t, controllingAgent.SetRemoteICELite(true))
+	gatherAndExchangeCandidates(t, controlledAgent, controllingAgent)
+
+	controlledUfrag, controlledPwd, err := controlledAgent.GetLocalUserCredentials()
+	require.NoError(t, err)
+	controllingUfrag, controllingPwd, err := controllingAgent.GetLocalUserCredentials()
+	require.NoError(t, err)
+
+	controlledConn, err := controlledAgent.StartAccept(controllingUfrag, controllingPwd)
+	require.NoError(t, err)
+	controllingConn, err := controllingAgent.StartDial(controlledUfrag, controlledPwd)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	require.NoError(t, controllingAgent.AwaitConnect(ctx), "controlling ICE-lite agent must connect")
+	require.NoError(t, controlledAgent.AwaitConnect(ctx), "controlled ICE-lite agent must connect")
+	require.Equal(t, Controlling, controllingAgent.role())
+	require.Equal(t, Controlled, controlledAgent.role())
+
+	for _, agent := range []*Agent{controlledAgent, controllingAgent} {
+		for _, stats := range agent.GetCandidatePairsStats() {
+			require.Zero(t, stats.RequestsSent)
+			require.Zero(t, stats.RequestsReceived)
+		}
+	}
+
+	require.True(t, sendUntilDone(t, controllingConn, controlledConn, 100))
+	require.True(t, sendUntilDone(t, controlledConn, controllingConn, 120))
 }

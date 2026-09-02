@@ -169,9 +169,14 @@ func (a *Agent) GatherCandidates() error {
 
 func (a *Agent) gatherCandidates(ctx context.Context, done chan struct{}) { //nolint:cyclop
 	defer close(done)
-	if err := a.setGatheringState(GatheringStateGathering); err != nil { //nolint:contextcheck
+	applied, err := a.setGatheringState(ctx, GatheringStateGathering)
+	if err != nil {
 		a.log.Warnf("Failed to set gatheringState to GatheringStateGathering: %v", err)
 
+		return
+	}
+	// The cycle was canceled before it started, so skip its gathering.
+	if !applied {
 		return
 	}
 
@@ -179,7 +184,7 @@ func (a *Agent) gatherCandidates(ctx context.Context, done chan struct{}) { //no
 
 	switch a.continualGatheringPolicy {
 	case GatherOnce:
-		if err := a.setGatheringState(GatheringStateComplete); err != nil { //nolint:contextcheck
+		if _, err := a.setGatheringState(ctx, GatheringStateComplete); err != nil {
 			a.log.Warnf("Failed to set gatheringState to GatheringStateComplete: %v", err)
 		}
 	case GatherContinually:
@@ -786,7 +791,7 @@ func (a *Agent) gatherCandidatesSrflxUDPMux(ctx context.Context, urls []*stun.UR
 						return
 					}
 
-					xorAddr, err := a.udpMuxSrflx.GetXORMappedAddr(serverAddr, a.stunGatherTimeout)
+					xorAddr, err := getXORMappedAddr(ctx, a.udpMuxSrflx, serverAddr, a.stunGatherTimeout)
 					if err != nil {
 						a.log.Warnf("Failed get server reflexive address %s %s: %v", network, url, err)
 
@@ -833,6 +838,27 @@ func (a *Agent) gatherCandidatesSrflxUDPMux(ctx context.Context, urls []*stun.UR
 			}
 		}
 	}
+}
+
+type contextXORMappedAddrGetter interface {
+	GetXORMappedAddrContext(context.Context, net.Addr, time.Duration) (*stun.XORMappedAddress, error)
+}
+
+func getXORMappedAddr(
+	ctx context.Context,
+	mux UniversalUDPMux,
+	serverAddr net.Addr,
+	deadline time.Duration,
+) (*stun.XORMappedAddress, error) {
+	if muxWithContext, ok := mux.(contextXORMappedAddrGetter); ok {
+		return muxWithContext.GetXORMappedAddrContext(ctx, serverAddr, deadline)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	return mux.GetXORMappedAddr(serverAddr, deadline)
 }
 
 //nolint:cyclop,gocognit
@@ -895,7 +921,14 @@ func (a *Agent) gatherCandidatesSrflx(ctx context.Context, urls []*stun.URI, net
 			}
 		}()
 
-		xorAddr, err := stunx.GetXORMappedAddr(conn, serverAddr, a.stunGatherTimeout)
+		transaction, err := stunx.NewXORMappedAddrTransaction()
+		if err != nil {
+			closeConnAndLog(conn, a.log, "failed to create STUN transaction for %s %s: %v", network, url, err)
+
+			return
+		}
+
+		xorAddr, err := transaction.RunPacketConn(ctx, conn, serverAddr, a.stunGatherTimeout)
 		if err != nil {
 			closeConnAndLog(conn, a.log, "failed to get server reflexive address %s %s: %v", network, url, err)
 
