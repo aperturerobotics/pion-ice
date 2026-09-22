@@ -404,9 +404,14 @@ func (a *Agent) Gather(opts ...GatherOption) error {
 
 // startGatherGeneration runs on the agent loop when the local credentials change.
 func (a *Agent) startGatherGeneration(config *gatherConfig) {
-	if a.gatheringState != GatheringStateNew {
-		a.gatherGeneration++
+	if a.gatheringState == GatheringStateNew {
+		// Connectivity checks may start before the first gather. Keep their
+		// remote credentials and candidates when assigning local credentials.
+		a.localUfrag, a.localPwd = config.localUfrag, config.localPwd
+
+		return
 	}
+	a.gatherGeneration++
 	a.removeUfragFromMux()
 	a.localUfrag, a.localPwd = config.localUfrag, config.localPwd
 	a.remoteUfrag, a.remotePwd = "", ""

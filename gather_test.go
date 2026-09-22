@@ -261,6 +261,21 @@ func TestGatherWithRestartPreservesCredentials(t *testing.T) {
 	require.Equal(t, uint64(1), agent.gatherGeneration)
 }
 
+func TestInitialGatherPreservesRemoteCredentials(t *testing.T) {
+	defer test.CheckRoutines(t)()
+	agent, err := NewAgent(WithNet(newHostGatherNet(nil)), WithMulticastDNSMode(MulticastDNSModeDisabled), WithIncludeLoopback())
+	require.NoError(t, err)
+	defer func() { require.NoError(t, agent.Close()) }()
+
+	require.NoError(t, agent.SetRemoteCredentials("remoteufrag", "remotepassword123456789"))
+	options := []GatherOption{WithNetworkTypes([]NetworkType{NetworkTypeUDP4}), WithCandidateTypes([]CandidateType{CandidateTypeHost})}
+	require.NotEmpty(t, gatherAndCollectCandidates(t, agent, options...))
+	ufrag, password, err := agent.GetRemoteUserCredentials()
+	require.NoError(t, err)
+	require.Equal(t, "remoteufrag", ufrag)
+	require.Equal(t, "remotepassword123456789", password)
+}
+
 func TestLoopbackCandidate(t *testing.T) {
 	defer test.CheckRoutines(t)()
 
