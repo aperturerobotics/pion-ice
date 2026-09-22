@@ -35,6 +35,7 @@ type gatherConfig struct {
 	localUfrag             string
 	localPwd               string
 	localCredentialsSet    bool
+	restart                bool
 }
 
 func newGatherConfig(opts ...GatherOption) (*gatherConfig, error) {
@@ -112,6 +113,16 @@ func WithLocalCredentials(ufrag, pwd string) GatherOption {
 		config.localUfrag = ufrag
 		config.localPwd = pwd
 		config.localCredentialsSet = true
+
+		return nil
+	}
+}
+
+// WithRestart starts a fresh ICE generation even when the supplied local
+// credentials match the current generation.
+func WithRestart() GatherOption {
+	return func(config *gatherConfig) error {
+		config.restart = true
 
 		return nil
 	}
@@ -349,7 +360,7 @@ func (a *Agent) Gather(opts ...GatherOption) error {
 		}
 
 		a.gatherCandidateCancel()
-		if a.localUfrag != config.localUfrag || a.localPwd != config.localPwd {
+		if config.restart || a.localUfrag != config.localUfrag || a.localPwd != config.localPwd {
 			a.startGatherGeneration(config)
 		}
 		config.mDNSMode = a.mDNSMode
