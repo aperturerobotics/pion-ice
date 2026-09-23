@@ -47,12 +47,12 @@ type handlerNotification[T any] struct {
 
 type handlerNotifier[T any] struct {
 	sync.Mutex
-	running   bool
-	notifiers sync.WaitGroup
-	queue     []handlerNotification[T]
-	handler   func(T)
+	running    bool
+	notifiers  sync.WaitGroup
+	queue      []handlerNotification[T]
+	handler    func(T)
 	handlerSet bool
-	done      chan struct{}
+	done       chan struct{}
 }
 
 func (h *handlerNotifier[T]) setHandler(f func(T)) {
